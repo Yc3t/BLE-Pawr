@@ -1,0 +1,37 @@
+/*
+ * Copyright (c) 2024 Novel Bits, LLC
+ *
+ * SPDX-License-Identifier: MIT License
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+	status = "okay";
+};
+
+&pinctrl {
+	/* Add any specific pin configurations for the dongle hardware here */
+};
+
+/* I2C configuration for the SHT4X sensor */
+&i2c0 {
+	status = "okay";
+	sht4x@44 {
+		compatible = "sensirion,sht4x";
+		reg = <0x44>;
+		repeatability = <2>;  /* Medium repeatability */
+	};
+};
+
+/* BLE antenna configuration if needed */
+&radio {
+	status = "okay";
+}; 

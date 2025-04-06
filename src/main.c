@@ -13,6 +13,7 @@
 #include "app/device_id.h"
 #include "app/sensor_node_sm.h"
 #include "app/ble_interface.h"
+#include "app/ble_interface.c"
 
 // Define delay for main loop
 #define LOOP_DELAY_MS 1000 // Regular loop delay

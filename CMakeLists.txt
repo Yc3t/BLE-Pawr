@@ -3,5 +3,8 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(beacon3-dongle)
 
+# Enable generation of compile_commands.json
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 FILE(GLOB app_sources src/*.c src/app/*.c)
 target_sources(app PRIVATE ${app_sources})

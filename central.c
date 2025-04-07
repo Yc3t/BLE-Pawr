@@ -39,11 +39,49 @@ static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
 #define PAWR_CMD_FIXED_PAYLOAD 0x01
 #define PAWR_CMD_SLEEP_REQUEST 0x02
 
-// Forward declaration for timer callback
+// Define a structure to track sensor data collection
+typedef struct {
+    bool data_received;        // Whether we've received data from this sensor
+    uint32_t last_heard_time;  // Last time we heard from this sensor
+    uint8_t device_id;         // Device ID of the sensor
+} sensor_tracker_t;
+
+// Tracker array for all sensors
+static sensor_tracker_t sensor_trackers[NUM_SENSORS] = {0};
+
+// Timeout for waiting for all sensors (in ms)
+#define SENSOR_COLLECTION_TIMEOUT_MS 5000
+
+// Flag to indicate if we're in data collection phase or sleep command phase
+static enum {
+    PHASE_DATA_COLLECTION,  // Collecting data from all sensors
+    PHASE_SLEEP_COMMAND     // Sending sleep commands to sensors
+} operation_phase = PHASE_DATA_COLLECTION;
+
+// Index of the next sensor to send sleep command to
+static int next_sleep_cmd_idx = 0;
+
+// A delay between sending sleep commands to different sensors
+#define SLEEP_CMD_INTERVAL_MS 500
+
+// Sleep duration command - all sensors will be told to sleep for this time
+#define SENSOR_SLEEP_DURATION_S 10
+
+// Forward declarations for all functions that are used before being defined
 static void cmd_reset_timeout(struct k_timer *timer);
+static void collection_timeout_handler(struct k_timer *timer);
+static void send_next_sleep_cmd(struct k_timer *timer);
+static bool all_sensors_reported(void);
+static void init_sensor_trackers(void);
 
 // Add a timer to reset the command back to fixed payload
 K_TIMER_DEFINE(cmd_reset_timer, cmd_reset_timeout, NULL);
+
+// Timer for sensor collection timeout
+K_TIMER_DEFINE(collection_timer, collection_timeout_handler, NULL);
+
+// Timer for sending sleep commands
+K_TIMER_DEFINE(sleep_cmd_timer, send_next_sleep_cmd, NULL);
 
 typedef struct adv_data
 {
@@ -501,15 +539,33 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
                 }
             }
             
-            // After receiving data, send a sleep command to the sensor node
-            printk("Sending sleep command to sensor node #%d\n", device_id);
-            
-            // Change the command for the next request to be a sleep command
-            current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
-            
-            // The command will be sent in the next periodic advertising event
-            // After that, revert back to the fixed payload command for future requests
-            k_timer_start(&cmd_reset_timer, K_MSEC(500), K_NO_WAIT);
+            // Update tracker info
+            if (device_id > 0 && device_id <= NUM_SENSORS) {
+                int idx = device_id - 1;  // Convert to 0-based index
+                sensor_trackers[idx].device_id = device_id;
+                sensor_trackers[idx].data_received = true;
+                sensor_trackers[idx].last_heard_time = k_uptime_get_32();
+                
+                printk("Marked sensor #%d as received\n", device_id);
+                
+                // If we've heard from all sensors and we're in data collection phase,
+                // move to sleep command phase
+                if (operation_phase == PHASE_DATA_COLLECTION && all_sensors_reported()) {
+                    printk("All sensors have reported. Moving to sleep command phase.\n");
+                    
+                    // Cancel the collection timeout timer
+                    k_timer_stop(&collection_timer);
+                    
+                    // Switch to sleep command phase
+                    operation_phase = PHASE_SLEEP_COMMAND;
+                    
+                    // Reset index for sleep commands
+                    next_sleep_cmd_idx = 0;
+                    
+                    // Start sending sleep commands with a short delay
+                    k_timer_start(&sleep_cmd_timer, K_MSEC(500), K_NO_WAIT);
+                }
+            }
         }
         else
         {
@@ -527,6 +583,7 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
     }
 }
 
+// Reset the command to fixed payload request
 static void cmd_reset_timeout(struct k_timer *timer)
 {
     current_pawr_command = PAWR_CMD_FIXED_PAYLOAD;
@@ -564,6 +621,100 @@ static int init_button(void)
     return err;
 }
 
+// Check if all sensors have reported or if we've timed out
+static bool all_sensors_reported(void)
+{
+    bool all_reported = true;
+    
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        // If this sensor is active and hasn't reported data, we're not done
+        if (sensor_trackers[i].device_id != 0 && !sensor_trackers[i].data_received) {
+            all_reported = false;
+            break;
+        }
+    }
+    
+    return all_reported;
+}
+
+// Handler for sensor collection timeout
+static void collection_timeout_handler(struct k_timer *timer)
+{
+    printk("Sensor collection timeout reached. Moving to sleep command phase.\n");
+    
+    // Switch to sleep command phase
+    operation_phase = PHASE_SLEEP_COMMAND;
+    
+    // Reset index for sleep commands
+    next_sleep_cmd_idx = 0;
+    
+    // Start sending sleep commands
+    k_timer_start(&sleep_cmd_timer, K_NO_WAIT, K_NO_WAIT);
+}
+
+// Send sleep command to the next sensor that reported data
+static void send_next_sleep_cmd(struct k_timer *timer)
+{
+    bool cmd_sent = false;
+    
+    // Find the next sensor that has reported data
+    while (next_sleep_cmd_idx < NUM_SENSORS && !cmd_sent) {
+        if (sensor_trackers[next_sleep_cmd_idx].data_received) {
+            uint8_t device_id = sensor_trackers[next_sleep_cmd_idx].device_id;
+            
+            printk("Sending sleep command to sensor node #%d\n", device_id);
+            
+            // Change command to sleep request
+            current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
+            
+            // Reset command after a short delay
+            k_timer_start(&cmd_reset_timer, K_MSEC(300), K_NO_WAIT);
+            
+            cmd_sent = true;
+        }
+        
+        next_sleep_cmd_idx++;
+    }
+    
+    // If we've sent a command, schedule the next one
+    if (cmd_sent && next_sleep_cmd_idx < NUM_SENSORS) {
+        k_timer_start(&sleep_cmd_timer, K_MSEC(SLEEP_CMD_INTERVAL_MS), K_NO_WAIT);
+    } else {
+        // We're done sending sleep commands, reset to data collection phase
+        printk("All sleep commands sent. Waiting for sensors to wake up in %d seconds.\n", 
+               SENSOR_SLEEP_DURATION_S);
+        
+        // Reset all tracker data for next cycle
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            sensor_trackers[i].data_received = false;
+        }
+        
+        // Return to data collection phase
+        operation_phase = PHASE_DATA_COLLECTION;
+        
+        // Start the collection timer again after the sleep period + margin
+        k_timer_start(&collection_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S + 2), K_NO_WAIT);
+    }
+}
+
+// Initialize the sensor trackers
+static void init_sensor_trackers(void)
+{
+    // For simplicity, we pre-populate the device IDs
+    // In a real implementation, you might discover these dynamically
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        sensor_trackers[i].device_id = i + 1;  // Device IDs are 1-based
+        sensor_trackers[i].data_received = false;
+        sensor_trackers[i].last_heard_time = 0;
+    }
+    
+    // Start in data collection phase
+    operation_phase = PHASE_DATA_COLLECTION;
+    
+    // Start the collection timer
+    k_timer_start(&collection_timer, K_MSEC(SENSOR_COLLECTION_TIMEOUT_MS), K_NO_WAIT);
+}
+
 int main(void)
 {
     int err;
@@ -574,6 +725,7 @@ int main(void)
 
     init_bufs();
     init_button();
+    init_sensor_trackers();  // Initialize sensor tracking
     
     // Initialize LEDs
     err = dk_leds_init();

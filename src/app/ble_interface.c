@@ -79,6 +79,8 @@ static volatile bool sleep_requested = false;
 static volatile bool tx_success_signal = false;
 // Flag to indicate if the device is in the sleep period (checked by recv_cb)
 static volatile bool is_sleeping = false;
+// Sleep duration requested by the central
+static volatile uint32_t requested_sleep_duration_s = 10; // Default 10 seconds
 
 void ble_start_advertising(void)
 {
@@ -231,6 +233,22 @@ static void recv_cb(struct bt_le_per_adv_sync *sync,
             rsp_data.fixed_payload = fixed_payload;
             // Set the sleep request flag
             sleep_requested = true;
+            
+            // Extract sleep duration if provided in the manufacturer data payload
+            // We'll use a simplified approach here, where the command byte also carries the sleep duration
+            // In a more complex scenario, you might want to encode this in the payload
+            uint8_t sleep_duration_byte = 0;
+            if (buf->len >= 4) { // Check if there's enough data
+                sleep_duration_byte = buf->data[3]; // Use the fourth byte for sleep duration
+            }
+            
+            // If the duration byte is valid (not 0), use it; otherwise use default
+            if (sleep_duration_byte > 0) {
+                requested_sleep_duration_s = sleep_duration_byte;
+                printk("\tSleep duration requested: %d seconds\n", requested_sleep_duration_s);
+            } else {
+                printk("\tUsing default sleep duration: %d seconds\n", requested_sleep_duration_s);
+            }
         }
         // Remove old temperature/humidity logic
         // else if (request_command == PAWR_CMD_REQUEST_HUMIDITY)
@@ -296,6 +314,12 @@ bool ble_check_and_clear_sleep_request(void)
         sleep_requested = false; // Clear the flag after checking
     }
     return ret;
+}
+
+// Function to get the requested sleep duration
+uint32_t ble_get_sleep_duration(void)
+{
+    return requested_sleep_duration_s;
 }
 
 // Function called by main loop to enter the sleep period

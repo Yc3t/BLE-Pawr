@@ -70,9 +70,12 @@ int main(void)
 
         // Check for sleep requests from central
         if (ble_check_and_clear_sleep_request()) {
-            // Enter the sleep period when requested by central
-            printk("Sleep requested by central\n");
-            ble_enter_sleep_period(POST_TX_SLEEP_S);
+            // Get the sleep duration requested by the central
+            uint32_t sleep_duration = ble_get_sleep_duration();
+            
+            // Enter the sleep period with the requested duration
+            printk("Sleep requested by central for %d seconds\n", sleep_duration);
+            ble_enter_sleep_period(sleep_duration);
         } 
         // Check if data was successfully transmitted but no sleep command
         else if (ble_check_and_clear_tx_success_signal()) {

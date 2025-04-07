@@ -14,4 +14,13 @@ void ble_delete_per_adv_sync(void);
 
 bool ble_check_and_clear_sleep_request(void);
 
+// Function to get the requested sleep duration
+uint32_t ble_get_sleep_duration(void);
+
+// Function to check and clear the TX success signal
+bool ble_check_and_clear_tx_success_signal(void);
+
+// Function to enter sleep period
+void ble_enter_sleep_period(uint32_t duration_s);
+
 #endif

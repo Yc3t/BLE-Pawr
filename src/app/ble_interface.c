@@ -22,6 +22,7 @@ extern uint32_t fixed_payload;
 // #define PAWR_CMD_REQUEST_HUMIDITY 0x02
 // Add command expected by collector
 #define PAWR_CMD_FIXED_PAYLOAD 0x01
+#define PAWR_CMD_SLEEP_REQUEST 0x02
 
 static struct bt_conn *default_conn;
 static struct bt_le_per_adv_sync_transfer_param past_param;
@@ -222,6 +223,15 @@ static void recv_cb(struct bt_le_per_adv_sync *sync,
             // Set the fixed payload
             rsp_data.fixed_payload = fixed_payload;
         }
+        // Handle sleep request command
+        else if (request_command == PAWR_CMD_SLEEP_REQUEST)
+        {
+            printk("\tReceived sleep request command!\n");
+            // Set the fixed payload (still send the payload)
+            rsp_data.fixed_payload = fixed_payload;
+            // Set the sleep request flag
+            sleep_requested = true;
+        }
         // Remove old temperature/humidity logic
         // else if (request_command == PAWR_CMD_REQUEST_HUMIDITY)
         // {
@@ -274,6 +284,16 @@ bool ble_check_and_clear_tx_success_signal(void)
     bool ret = tx_success_signal;
     if (ret) {
         tx_success_signal = false; // Clear the flag after checking
+    }
+    return ret;
+}
+
+// Function for main loop to check if sleep was requested
+bool ble_check_and_clear_sleep_request(void)
+{
+    bool ret = sleep_requested;
+    if (ret) {
+        sleep_requested = false; // Clear the flag after checking
     }
     return ret;
 }

@@ -1,4 +1,3 @@
-
 #include <zephyr/sys/byteorder.h> // Needed for handling Little Endian data
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -36,6 +35,16 @@ static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
 // Device Discovery Definitions
 #define NOVEL_BITS_COMPANY_ID 0x08D3
 
+// PAwR command definitions
+#define PAWR_CMD_FIXED_PAYLOAD 0x01
+#define PAWR_CMD_SLEEP_REQUEST 0x02
+
+// Forward declaration for timer callback
+static void cmd_reset_timeout(struct k_timer *timer);
+
+// Add a timer to reset the command back to fixed payload
+K_TIMER_DEFINE(cmd_reset_timer, cmd_reset_timeout, NULL);
+
 typedef struct adv_data
 {
     // Device Name
@@ -51,8 +60,6 @@ typedef struct adv_data
 static uint8_t currently_connected_device_id = 0xFF;
 
 // PAwR Definitions
-#define PAWR_CMD_FIXED_PAYLOAD 0x01
-
 static uint8_t current_pawr_command = PAWR_CMD_FIXED_PAYLOAD;
 
 static K_SEM_DEFINE(sem_connected, 0, 1);
@@ -493,6 +500,16 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
                     printk("Failed to notify central (err %d)\n", err);
                 }
             }
+            
+            // After receiving data, send a sleep command to the sensor node
+            printk("Sending sleep command to sensor node #%d\n", device_id);
+            
+            // Change the command for the next request to be a sleep command
+            current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
+            
+            // The command will be sent in the next periodic advertising event
+            // After that, revert back to the fixed payload command for future requests
+            k_timer_start(&cmd_reset_timer, K_MSEC(500), K_NO_WAIT);
         }
         else
         {
@@ -508,6 +525,12 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
         printk("Failed to receive response: subevent %d, slot %d\n", info->subevent,
                info->response_slot);
     }
+}
+
+static void cmd_reset_timeout(struct k_timer *timer)
+{
+    current_pawr_command = PAWR_CMD_FIXED_PAYLOAD;
+    printk("Reset command to FIXED_PAYLOAD\n");
 }
 
 struct pawr_timing {

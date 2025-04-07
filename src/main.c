@@ -13,7 +13,6 @@
 #include "app/device_id.h"
 #include "app/sensor_node_sm.h"
 #include "app/ble_interface.h"
-#include "app/ble_interface.c"
 
 // Define delay for main loop
 #define LOOP_DELAY_MS 1000 // Regular loop delay
@@ -69,12 +68,19 @@ int main(void)
             break;
         }
 
-        // Check if the BLE interface signaled a successful transmission
-        if (ble_check_and_clear_tx_success_signal()) {
-            // Enter the sleep period (handled within ble_interface now)
+        // Check for sleep requests from central
+        if (ble_check_and_clear_sleep_request()) {
+            // Enter the sleep period when requested by central
+            printk("Sleep requested by central\n");
             ble_enter_sleep_period(POST_TX_SLEEP_S);
-        } else {
-            // Normal operation delay if no Tx happened or sleep isn't needed
+        } 
+        // Check if data was successfully transmitted but no sleep command
+        else if (ble_check_and_clear_tx_success_signal()) {
+            // No need to sleep if not requested by central
+            printk("Data transmitted successfully, no sleep requested\n");
+        } 
+        else {
+            // Normal operation delay
             k_msleep(LOOP_DELAY_MS);
         }
 

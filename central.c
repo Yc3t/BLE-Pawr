@@ -266,8 +266,13 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    /* We're only interested in connectable events */
-    if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+    // Print out the advertisement type for debugging
+    printk("Advertisement type: 0x%02X\n", type);
+
+    /* Accept both regular and extended advertising */
+    if (type != BT_GAP_ADV_TYPE_ADV_IND && 
+        type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
+        type != BT_GAP_ADV_TYPE_EXT_ADV) {
         return;
     }
 
@@ -291,7 +296,14 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_DEFAULT,
+    // Create extended advertising connection parameters with Coded PHY
+    struct bt_conn_le_create_param *conn_params = 
+        BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,
+                               BT_GAP_SCAN_FAST_INTERVAL,
+                               BT_GAP_SCAN_FAST_INTERVAL);
+
+    err = bt_conn_le_create(addr, conn_params,
+                BT_LE_CONN_PARAM_DEFAULT,
                 &central_conn);
     if (err) {
         printk("Create conn to %s failed (%u)\n", addr_str, err);
@@ -637,6 +649,14 @@ static bool all_sensors_reported(void)
     return all_reported;
 }
 
+// Define a custom scan parameter with Coded PHY support
+static const struct bt_le_scan_param scan_param = {
+    .type     = BT_LE_SCAN_TYPE_ACTIVE,
+    .interval = BT_GAP_SCAN_FAST_INTERVAL,
+    .window   = BT_GAP_SCAN_FAST_WINDOW,
+    .options  = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_NO_1M
+};
+
 // Handler for sensor collection timeout
 static void collection_timeout_handler(struct k_timer *timer)
 {
@@ -782,7 +802,7 @@ int main(void)
 
     while (1) {
         // Continuously scan for devices
-        err = bt_le_scan_start(BT_LE_SCAN_PASSIVE_CONTINUOUS, device_found);
+        err = bt_le_scan_start(&scan_param, device_found);
         if (err) {
             printk("Scanning failed to start (err %d)\n", err);
             return 0;

@@ -64,13 +64,15 @@ struct response_data {
 // Company ID for Novel Bits (used for the manufacturer data)
 #define NOVEL_BITS_COMPANY_ID 0x08D3
 
-// Advertising data
+// Advertising data - Update to match what central.c is looking for
 static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'N', 'o', 'v', 'e', 'l', ' ', 'B', 'i', 't', 's'),
-    BT_DATA_BYTES(BT_DATA_MANUFACTURER_DATA,
-                  (NOVEL_BITS_COMPANY_ID & 0xFF),
-                  ((NOVEL_BITS_COMPANY_ID >> 8) & 0xFF),
-                  DEVICE_ID)
+    // Critical change: Format manufacturer data exactly as central expects
+    BT_DATA_BYTES(BT_DATA_MANUFACTURER_DATA, 
+                 (NOVEL_BITS_COMPANY_ID & 0xFF),        // LSB first
+                 ((NOVEL_BITS_COMPANY_ID >> 8) & 0xFF), // MSB second
+                 DEVICE_ID)                             // Device ID third
 };
 
 // Flag to signal the main loop to sleep
@@ -82,15 +84,70 @@ static volatile bool is_sleeping = false;
 // Sleep duration requested by the central
 static volatile uint32_t requested_sleep_duration_s = 10; // Default 10 seconds
 
+// Add this to your global variables
+static struct bt_le_ext_adv *adv;
+
+// Add to your declarations for the callbacks
+static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_data_request *request);
+static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response_info *info,
+             struct net_buf_simple *buf);
+
+// Define the advertisement callbacks like in peripheral.c
+static const struct bt_le_ext_adv_cb adv_cb = {
+    .pawr_data_request = request_cb,
+    .pawr_response = response_cb,
+};
+
+// Add these stub callback implementations (you can leave them empty)
+static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_data_request *request)
+{
+    // Not needed for peripheral role
+}
+
+static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response_info *info,
+             struct net_buf_simple *buf)
+{
+    // Not needed for peripheral role
+}
+
 void ble_start_advertising(void)
 {
     int err;
 
-    err = bt_le_adv_start(
-        BT_LE_ADV_PARAM(BT_LE_ADV_OPT_ONE_TIME | BT_LE_ADV_OPT_CONNECTABLE,
-                        BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL), ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err && err != -EALREADY) {
+    // Create proper advertising parameters for a connectable advertisement
+    struct bt_le_adv_param param =
+        BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONNECTABLE |
+                     BT_LE_ADV_OPT_EXT_ADV |
+                     BT_LE_ADV_OPT_CODED,
+                     BT_GAP_ADV_FAST_INT_MIN_2,
+                     BT_GAP_ADV_FAST_INT_MAX_2,
+                     NULL);
+
+    // Create the advertising set if it doesn't exist
+    if (!adv) {
+        // Pass adv_cb to register the callbacks
+        err = bt_le_ext_adv_create(&param, &adv_cb, &adv);
+        if (err) {
+            printk("Failed to create advertiser set (err %d)\n", err);
+            return;
+        }
+        
+        // Set the advertising data
+        err = bt_le_ext_adv_set_data(adv, ad, ARRAY_SIZE(ad), NULL, 0);
+        if (err) {
+            printk("Failed to set advertising data (err %d)\n", err);
+            return;
+        }
+        
+        printk("Created extended advertising set successfully\n");
+    }
+
+    // Start advertising
+    err = bt_le_ext_adv_start(adv, NULL);
+    if (err) {
         printk("Advertising failed to start (err %d)\n", err);
+    } else {
+        printk("Started advertising with Coded PHY\n");
     }
 }
 
@@ -431,5 +488,9 @@ void ble_init(void)
     err = bt_enable(NULL);
     if (err) {
         printk("Bluetooth init failed (err %d)\n", err);
+        return;
     }
+    
+    // Add a small delay to ensure BT is fully initialized
+    k_sleep(K_MSEC(100));
 }

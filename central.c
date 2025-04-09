@@ -41,7 +41,8 @@ static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
 
 // Define a structure to track sensor data collection
 typedef struct {
-    bool data_received;        // Whether we've received data from this sensor
+    bool data_received;        // Whether we've received data from this sensor AT LEAST ONCE this cycle
+    uint8_t response_count;    // Number of responses received this cycle (up to 10)
     uint32_t last_heard_time;  // Last time we heard from this sensor
     uint8_t device_id;         // Device ID of the sensor
 } sensor_tracker_t;
@@ -50,13 +51,23 @@ typedef struct {
 static sensor_tracker_t sensor_trackers[NUM_SENSORS] = {0};
 
 // Timeout for waiting for all sensors (in ms)
-#define SENSOR_COLLECTION_TIMEOUT_MS 5000
+#define SENSOR_COLLECTION_TIMEOUT_MS 30000 // Use 30 seconds for scanning (increased from 10 seconds)
 
 // Flag to indicate if we're in data collection phase or sleep command phase
 static enum {
     PHASE_DATA_COLLECTION,  // Collecting data from all sensors
     PHASE_SLEEP_COMMAND     // Sending sleep commands to sensors
 } operation_phase = PHASE_DATA_COLLECTION;
+
+// Add central state machine - moved here before connected_cb for proper scope
+enum central_state {
+    STATE_SCANNING,       // Actively scanning for sensors
+    STATE_SLEEP_PENDING,  // Finished scanning, sending sleep commands
+    STATE_SLEEPING        // In sleep period, ignoring new sensors
+};
+
+// Current state of the central device - moved here before connected_cb
+static enum central_state current_state = STATE_SCANNING;
 
 // Index of the next sensor to send sleep command to
 static int next_sleep_cmd_idx = 0;
@@ -65,7 +76,7 @@ static int next_sleep_cmd_idx = 0;
 #define SLEEP_CMD_INTERVAL_MS 500
 
 // Sleep duration command - all sensors will be told to sleep for this time
-#define SENSOR_SLEEP_DURATION_S 10
+#define SENSOR_SLEEP_DURATION_S 60 // Use 60 seconds (1 minute) for sleep
 
 // Forward declarations for all functions that are used before being defined
 static void cmd_reset_timeout(struct k_timer *timer);
@@ -169,14 +180,28 @@ void connected_cb(struct bt_conn *conn, uint8_t err)
             
             // Turn on LED1 to indicate peripheral connection
             dk_set_led_on(DK_LED1);
+        } else {
+            // Connected as Central - give the semaphore to continue the flow
+            printk("Connected as Central to device ID: %d\n", currently_connected_device_id);
+            
+            // Since connection is successful, we'll give the semaphore later in remote_info_available
+            // This ensures the BLE stack has time to complete connection setup
         }
     }
     // Failure Case
     else
     {
+        printk("Connection failed with error 0x%02X\n", err);
+        
         if (conn == central_conn) {
             bt_conn_unref(central_conn);
             central_conn = NULL;
+            
+            // If connection fails, we should restart scanning
+            printk("Central connection failed, will restart scan in next cycle\n");
+            
+            // Simply return to scanning state
+            current_state = STATE_SCANNING;
         }
         else if (conn == peripheral_conn) {
             bt_conn_unref(peripheral_conn);
@@ -197,6 +222,10 @@ void disconnected_cb(struct bt_conn *conn, uint8_t reason)
         central_conn = NULL;
         k_sem_give(&sem_disconnected);
         currently_connected_device_id = 0xFF;
+        
+        // Add a small delay after disconnection 
+        // to ensure BT controller is in a clean state
+        k_sleep(K_MSEC(50));
     }
     else if (conn == peripheral_conn) {
         bt_conn_unref(peripheral_conn);
@@ -212,6 +241,12 @@ void remote_info_available_cb(struct bt_conn *conn, struct bt_conn_remote_info *
     /* Need to wait for remote info before initiating PAST  -- only as a Central*/
 
     if (conn == central_conn) {
+        printk("Remote info available for central connection\n");
+               
+        // Small delay to ensure stack is ready
+        k_sleep(K_MSEC(50));
+        
+        // Now we can proceed with PAST and other operations
         k_sem_give(&sem_connected);
     }
 }
@@ -255,61 +290,39 @@ static bool data_cb(struct bt_data *data, void *user_data)
     }
 }
 
+// Timer for the full sleep cycle
+K_TIMER_DEFINE(sleep_cycle_timer, NULL, NULL);
+
+// Forward declare scan_param
+static const struct bt_le_scan_param scan_param = {
+    .type     = BT_LE_SCAN_TYPE_ACTIVE,
+    .interval = BT_GAP_SCAN_FAST_INTERVAL,
+    .window   = BT_GAP_SCAN_FAST_WINDOW,
+    .options  = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_NO_1M
+};
+
+// Forward declare device_found
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
-             struct net_buf_simple *ad)
+             struct net_buf_simple *ad);
+
+// Add the missing struct definition
+struct pawr_timing {
+    uint8_t subevent;
+    uint8_t response_slot;
+} __packed;
+
+// Add missing function definitions
+static void init_bufs(void)
 {
-    int err;
-    char addr_str[BT_ADDR_LE_STR_LEN];
-    custom_adv_data_t device_ad_data;
+    for (size_t i = 0; i < ARRAY_SIZE(backing_store); i++) {
+        backing_store[i][0] = ARRAY_SIZE(backing_store[i]) - 1;
+        backing_store[i][1] = BT_DATA_MANUFACTURER_DATA;
+        backing_store[i][2] = (NOVEL_BITS_COMPANY_ID & 0xFF); /* Novel Bits */
+        backing_store[i][3] = ((NOVEL_BITS_COMPANY_ID >> 8) & 0xFF);
 
-    if (central_conn) {
-        return;
+        net_buf_simple_init_with_data(&bufs[i], &backing_store[i],
+                          ARRAY_SIZE(backing_store[i]));
     }
-
-    // Print out the advertisement type for debugging
-    printk("Advertisement type: 0x%02X\n", type);
-
-    /* Accept both regular and extended advertising */
-    if (type != BT_GAP_ADV_TYPE_ADV_IND && 
-        type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
-        type != BT_GAP_ADV_TYPE_EXT_ADV) {
-        return;
-    }
-
-    (void)memset(&device_ad_data, 0, sizeof(device_ad_data));
-    bt_data_parse(ad, data_cb, &device_ad_data);
-
-    if (!device_ad_data.novelbits_id_present) {
-        return;
-    }
-
-    printk("Device found: %s (RSSI %d)\n", device_ad_data.name, rssi);
-    printk("Manufacturer specific data [Novel Bits]. ID = 0x%02X\n", device_ad_data.data[2]);
-
-    if (device_ad_data.data[2] > NUM_SENSORS)
-    {
-        printk("Invalid device ID\n");
-        return;
-    }
-
-    if (bt_le_scan_stop()) {
-        return;
-    }
-
-    // Create extended advertising connection parameters with Coded PHY
-    struct bt_conn_le_create_param *conn_params = 
-        BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,
-                               BT_GAP_SCAN_FAST_INTERVAL,
-                               BT_GAP_SCAN_FAST_INTERVAL);
-
-    err = bt_conn_le_create(addr, conn_params,
-                BT_LE_CONN_PARAM_DEFAULT,
-                &central_conn);
-    if (err) {
-        printk("Create conn to %s failed (%u)\n", addr_str, err);
-    }
-
-    currently_connected_device_id = device_ad_data.data[2];
 }
 
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -344,23 +357,403 @@ static void write_func(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_p
 {
     if (err) {
         printk("Write failed (err %d)\n", err);
-
         return;
     }
 
     k_sem_give(&sem_written);
 }
 
-void init_bufs(void)
-{
-    for (size_t i = 0; i < ARRAY_SIZE(backing_store); i++) {
-        backing_store[i][0] = ARRAY_SIZE(backing_store[i]) - 1;
-        backing_store[i][1] = BT_DATA_MANUFACTURER_DATA;
-        backing_store[i][2] = (NOVEL_BITS_COMPANY_ID & 0xFF); /* Novel Bits */
-        backing_store[i][3] = ((NOVEL_BITS_COMPANY_ID >> 8) & 0xFF);
+#define USER_BUTTON DK_BTN1_MSK
 
-        net_buf_simple_init_with_data(&bufs[i], &backing_store[i],
-                          ARRAY_SIZE(backing_store[i]));
+static void button_changed(uint32_t button_state, uint32_t has_changed)
+{
+    if (has_changed & USER_BUTTON) {
+        uint32_t user_button_state = button_state & USER_BUTTON;
+
+        if (user_button_state) {
+            printk("Button pressed\n");
+            // No need to toggle commands now as we only have one fixed payload
+        }
+    }
+}
+
+static int init_button(void)
+{
+    int err;
+
+    err = dk_buttons_init(button_changed);
+    if (err) {
+        printk("Cannot init buttons (err: %d)\n", err);
+    }
+
+    return err;
+}
+
+// Reset the command to fixed payload request
+static void cmd_reset_timeout(struct k_timer *timer)
+{
+    current_pawr_command = PAWR_CMD_FIXED_PAYLOAD;
+    printk("Reset command to FIXED_PAYLOAD\n");
+}
+
+// Initialize the sensor trackers
+static void init_sensor_trackers(void)
+{
+    // For simplicity, we pre-populate the device IDs
+    // In a real implementation, you might discover these dynamically
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        sensor_trackers[i].device_id = i + 1;  // Device IDs are 1-based
+        sensor_trackers[i].data_received = false;
+        sensor_trackers[i].response_count = 0; // Reset response count
+        sensor_trackers[i].last_heard_time = 0;
+    }
+    
+    // Start in data collection phase
+    operation_phase = PHASE_DATA_COLLECTION;
+    
+    // Start the collection timer
+    k_timer_start(&collection_timer, K_MSEC(SENSOR_COLLECTION_TIMEOUT_MS), K_NO_WAIT);
+}
+
+// Add restart_scan_handler forward declaration
+static void restart_scan_handler(struct k_work *work);
+
+// Define the work item
+K_WORK_DELAYABLE_DEFINE(restart_scan_work, restart_scan_handler);
+
+// Update collection_timeout_handler to transition to SLEEP_PENDING state
+static void collection_timeout_handler(struct k_timer *timer)
+{
+    printk("Sensor collection timeout reached (30 seconds). Moving to sleep command phase.\n");
+    
+    // Switch to sleep command phase
+    operation_phase = PHASE_SLEEP_COMMAND;
+    current_state = STATE_SLEEP_PENDING;
+    
+    // Reset index for sleep commands
+    next_sleep_cmd_idx = 0;
+    
+    // Start sending sleep commands
+    k_timer_start(&sleep_cmd_timer, K_NO_WAIT, K_NO_WAIT);
+}
+
+// Update send_next_sleep_cmd to transition to SLEEPING state
+static void send_next_sleep_cmd(struct k_timer *timer)
+{
+    bool cmd_sent = false;
+    
+    // Find the next sensor that has reported data
+    while (next_sleep_cmd_idx < NUM_SENSORS && !cmd_sent) {
+        if (sensor_trackers[next_sleep_cmd_idx].data_received) {
+            uint8_t device_id = sensor_trackers[next_sleep_cmd_idx].device_id;
+            
+            printk("Sending sleep command to sensor node #%d\n", device_id);
+            
+            // Change command to sleep request
+            current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
+            
+            // Reset command after a short delay
+            k_timer_start(&cmd_reset_timer, K_MSEC(300), K_NO_WAIT);
+            
+            cmd_sent = true;
+        }
+        
+        next_sleep_cmd_idx++;
+    }
+    
+    // If we've sent a command, schedule the next one with a short delay
+    if (cmd_sent && next_sleep_cmd_idx < NUM_SENSORS) {
+        k_timer_start(&sleep_cmd_timer, K_MSEC(SLEEP_CMD_INTERVAL_MS), K_NO_WAIT);
+    } else {
+        // Record the exact time we finish sending all sleep commands
+        // This will be our reference for calculating the true sleep duration
+        uint32_t sleep_start_time = k_uptime_get_32();
+        
+        // We're done sending sleep commands, enter full sleep mode
+        printk("All sleep commands sent at timestamp %u ms. Entering sleep period for %d seconds.\n", 
+               sleep_start_time, SENSOR_SLEEP_DURATION_S);
+        
+        // Enter sleeping state - we'll ignore new sensors during this time
+        current_state = STATE_SLEEPING;
+        
+        // Start a timer for the sleep period
+        k_timer_start(&sleep_cycle_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S), K_NO_WAIT);
+        
+        // Calculate a more accurate wake time to ensure sync with sensors
+        // We want to wake up slightly before the sensors do, so we can be ready to scan
+        // when they start advertising
+        uint32_t elapsed_ms = k_uptime_get_32() - sleep_start_time;
+        uint32_t adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000) - elapsed_ms;
+        
+        // Ensure we don't schedule with negative time
+        if (adjusted_sleep_ms > (SENSOR_SLEEP_DURATION_S * 1000)) {
+            adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000);
+        }
+        
+        // Wake up 500ms before the sensors should wake up
+        if (adjusted_sleep_ms > 500) {
+            adjusted_sleep_ms -= 500;
+        }
+        
+        printk("Scheduling wake-up in %u ms (adjusted for command transmission time)\n", 
+               adjusted_sleep_ms);
+        
+        // When sleep period is over, we'll start scanning again
+        k_work_schedule(&restart_scan_work, K_MSEC(adjusted_sleep_ms));
+    }
+}
+
+// Improve the restart_scan_handler function for better synchronization
+static void restart_scan_handler(struct k_work *work)
+{
+    int err;
+    
+    printk("Sleep period of %d seconds completed. Preparing to restart scan cycle...\n", 
+           SENSOR_SLEEP_DURATION_S);
+    
+    // Reset all tracker data for next cycle
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        sensor_trackers[i].data_received = false;
+        sensor_trackers[i].response_count = 0; // Reset response count for the new cycle
+    }
+    
+    // Return to data collection phase
+    operation_phase = PHASE_DATA_COLLECTION;
+    current_state = STATE_SCANNING;
+    
+    // Add a delay BEFORE starting the scan to allow sensors time to wake up and start advertising
+    // This is critical for synchronization - sensors may need time to initialize their advertisers
+    printk("Waiting 1 second for sensors to initialize advertising...\n");
+    k_sleep(K_SECONDS(1));
+    
+    printk("Starting collection timer for %d ms...\n", SENSOR_COLLECTION_TIMEOUT_MS);
+    // Start the collection timer for the next cycle with a slightly longer timeout
+    // to account for the extra initialization time
+    k_timer_start(&collection_timer, K_MSEC(SENSOR_COLLECTION_TIMEOUT_MS + 1000), K_NO_WAIT);
+    
+    // First, attempt to stop any ongoing scan (ignore errors)
+    bt_le_scan_stop();
+    
+    // Add a small delay to ensure BT controller has time to reset
+    k_sleep(K_MSEC(100));
+    
+    // Start scanning for devices with retry mechanism
+    int retry_count = 0;
+    const int max_retries = 3;
+    bool scan_started = false;
+    
+    while (!scan_started && retry_count < max_retries) {
+        err = bt_le_scan_start(&scan_param, device_found);
+    if (err) {
+            retry_count++;
+            printk("Scanning failed to start (err %d), retry %d of %d\n", 
+                   err, retry_count, max_retries);
+            
+            // Wait a bit longer between retries
+            k_sleep(K_MSEC(200 * retry_count));
+            
+            // If this is the last retry, we'll continue with the cycle anyway
+            if (retry_count >= max_retries) {
+                printk("Failed to restart scanning after multiple attempts\n");
+                
+                // Even though scanning failed, we'll continue with the cycle
+                // The collection timeout will eventually trigger and move to sleep phase
+                scan_started = true;
+            }
+        } else {
+            printk("Started new scan cycle to collect sensor data\n");
+            scan_started = true;
+        }
+    }
+}
+
+// Update response_cb to track sensors only in scanning state and limit to 10 responses
+static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response_info *info,
+             struct net_buf_simple *buf)
+{
+    if (buf) {
+        // Turn on LED2 to indicate data reception
+        dk_set_led_on(DK_LED2);
+
+        printk("\nReceived Response in Subevent #%d, Response Slot #%d [Data length = %d bytes]\n", info->subevent, info->response_slot, buf->len);
+
+        // Only process responses when in scanning state
+        if (current_state == STATE_SCANNING) {
+            // Validate the data format first
+            if ((buf->len == RESPONSE_DATA_SIZE+1)
+                && (buf->data[0] == RESPONSE_DATA_SIZE) 
+                && buf->data[1] == 0xFF // Manufacturer Specific Data type (0xFF)
+                && (buf->data[2] == (NOVEL_BITS_COMPANY_ID & 0xFF)) && (buf->data[3] == (NOVEL_BITS_COMPANY_ID >> 8)))
+            {
+                uint8_t device_id = buf->data[4];
+                uint32_t fixed_payload = *(uint32_t *)&(buf->data[5]);
+
+                // Check if sensor ID is valid
+                if (device_id > 0 && device_id <= NUM_SENSORS) {
+                    int idx = device_id - 1;  // Convert to 0-based index
+
+                    // Check if we have already received 10 responses from this sensor
+                    if (sensor_trackers[idx].response_count >= 10) {
+                        printk("Sensor #%d already reported 10 times. Ignoring further data this cycle.\n", device_id);
+                    } else {
+                        // Increment response count
+                        sensor_trackers[idx].response_count++;
+
+                        printk("\t---- SENSOR NODE #%d (Response %d/10) ----\n\tFixed Payload: 0x%08X\n", 
+                               device_id, sensor_trackers[idx].response_count, fixed_payload);
+                        
+                        // Store the received value (can be overwritten by subsequent responses)
+                        sensor_fixed_values[idx] = fixed_payload;
+
+                        // Mark data as received (at least once)
+                        sensor_trackers[idx].data_received = true; 
+                        sensor_trackers[idx].device_id = device_id; // Ensure device ID is set
+                        sensor_trackers[idx].last_heard_time = k_uptime_get_32();
+                        
+                        printk("Marked sensor #%d as received (response %d/10)\n", 
+                               device_id, sensor_trackers[idx].response_count);
+                        
+                        // If we've heard from all sensors (10 times each) and we're in data collection phase,
+                        // move to sleep command phase
+                        if (operation_phase == PHASE_DATA_COLLECTION && all_sensors_reported()) {
+                            printk("All sensors have reported 10 times each. Moving to sleep command phase.\n");
+                            
+                            // Cancel the collection timeout timer
+                            k_timer_stop(&collection_timer);
+                            
+                            // Switch to sleep command phase
+                            operation_phase = PHASE_SLEEP_COMMAND;
+                            current_state = STATE_SLEEP_PENDING;
+                            
+                            // Reset index for sleep commands
+                            next_sleep_cmd_idx = 0;
+                            
+                            // Start sending sleep commands with a short delay
+                            k_timer_start(&sleep_cmd_timer, K_MSEC(500), K_NO_WAIT);
+                        }
+                    }
+                } else {
+                    printk("Invalid device ID %d received\n", device_id);
+                }
+            }
+            else
+            {
+                printk("Invalid data format received\n");
+            }
+        }
+
+        // After processing data, turn off LED2
+        k_sleep(K_MSEC(50));  // Brief flash
+        dk_set_led_off(DK_LED2);
+    }
+    else 
+    {
+        printk("Failed to receive response: subevent %d, slot %d\n", info->subevent,
+               info->response_slot);
+    }
+}
+
+// Check if all sensors have reported 10 TIMES (not just once)
+static bool all_sensors_reported(void)
+{
+    bool all_reported = true;
+    
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        // If this sensor is expected (device_id is set) and hasn't reported data 10 times
+        if (sensor_trackers[i].device_id != 0 && sensor_trackers[i].response_count < 10) {
+            all_reported = false;
+            break;
+        }
+    }
+    
+    return all_reported;
+}
+
+// Update device_found to more robustly handle scan stop
+static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
+             struct net_buf_simple *ad)
+{
+    int err;
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    custom_adv_data_t device_ad_data;
+
+    // Skip device processing if we're not in scanning state
+    if (current_state != STATE_SCANNING) {
+        return;
+    }
+
+    // If we already have a connection, don't try to establish another one
+    if (central_conn) {
+        return;
+    }
+
+    // Print out the advertisement type for debugging
+    printk("Advertisement type: 0x%02X\n", type);
+
+    /* Accept both regular and extended advertising */
+    if (type != BT_GAP_ADV_TYPE_ADV_IND && 
+        type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
+        type != BT_GAP_ADV_TYPE_EXT_ADV) {
+        return;
+    }
+
+    (void)memset(&device_ad_data, 0, sizeof(device_ad_data));
+    bt_data_parse(ad, data_cb, &device_ad_data);
+
+    if (!device_ad_data.novelbits_id_present) {
+        return;
+    }
+
+    printk("Device found: %s (RSSI %d)\n", device_ad_data.name, rssi);
+    printk("Manufacturer specific data [Novel Bits]. ID = 0x%02X\n", device_ad_data.data[2]);
+
+    if (device_ad_data.data[2] > NUM_SENSORS) {
+        printk("Invalid device ID\n");
+        return;
+    }
+
+    // Try to stop scanning, but handle failure gracefully
+    err = bt_le_scan_stop();
+    if (err) {
+        printk("Failed to stop scanning (err %d), will try again\n", err);
+        
+        // Try briefly waiting and stopping again
+        k_sleep(K_MSEC(50));
+        err = bt_le_scan_stop();
+        
+    if (err) {
+            printk("Still failed to stop scanning (err %d), continuing anyway\n", err);
+            // We'll continue despite the error
+        }
+    }
+
+    // Convert the address to string for logging
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+
+    // Create extended advertising connection parameters with Coded PHY
+    struct bt_conn_le_create_param *conn_params = 
+        BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,
+                               BT_GAP_SCAN_FAST_INTERVAL,
+                               BT_GAP_SCAN_FAST_INTERVAL);
+
+    err = bt_conn_le_create(addr, conn_params,
+                BT_LE_CONN_PARAM_DEFAULT,
+                &central_conn);
+    if (err) {
+        printk("Create conn to %s failed (%d)\n", addr_str, err);
+        
+        // If connection creation fails, we should restart scanning
+        // but with a small delay to allow the controller to reset
+        k_sleep(K_MSEC(100));
+        err = bt_le_scan_start(&scan_param, device_found);
+        if (err) {
+            printk("Failed to restart scanning after connection failure (err %d)\n", err);
+        }
+    } else {
+        // Successfully initiated connection
+        currently_connected_device_id = device_ad_data.data[2];
+        printk("Connecting to device ID %d at %s\n", 
+               currently_connected_device_id, addr_str);
     }
 }
 
@@ -476,11 +869,17 @@ struct response_data {
     uint32_t fixed_payload;  // Fixed 31-bit payload (actually using 32 bits)
 } __packed;
 
+// Add request_cb to ignore sensors during sleep period
 static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_data_request *request)
 {
     int err;
     uint8_t to_send;
     struct net_buf_simple *buf;
+
+    // Ignore requests if we're in sleep mode
+    if (current_state == STATE_SLEEPING) {
+        return;
+    }
 
     to_send = MIN(request->count, ARRAY_SIZE(subevent_data_params));
 
@@ -501,247 +900,13 @@ static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_dat
     }
 }
 
-static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response_info *info,
-             struct net_buf_simple *buf)
-{
-    if (buf) {
-        // Turn on LED2 to indicate data reception
-        dk_set_led_on(DK_LED2);
-
-        printk("\n\nReceived Response in Subevent #%d, Response Slot #%d [Data length = %d bytes]\n", info->subevent, info->response_slot, buf->len);
-
-        // Format of data is as follows:
-        // [0] Length
-        // [1] Type
-        // [2] Company ID (LSB)
-        // [3] Company ID (MSB)
-        // [4] Device ID
-        // [5-8] Fixed Payload (4 bytes)
-
-        // Validate the data received:
-        if ((buf->len == RESPONSE_DATA_SIZE+1)
-            && (buf->data[0] == RESPONSE_DATA_SIZE) 
-            && buf->data[1] == 0xFF // Manufacturer Specific Data type (0xFF)
-            && (buf->data[2] == (NOVEL_BITS_COMPANY_ID & 0xFF)) && (buf->data[3] == (NOVEL_BITS_COMPANY_ID >> 8)))
-        {
-            uint8_t device_id = buf->data[4];
-            uint32_t fixed_payload = *(uint32_t *)&(buf->data[5]);
-
-            printk("\t---- SENSOR NODE #%d ----\n\tFixed Payload: 0x%08X\n", device_id, fixed_payload);
-            
-            // Store the received value
-            sensor_fixed_values[device_id-1] = fixed_payload;
-
-            // Define initial characteristic declaration index and offset
-            #define INITIAL_DATA_CHAR_DEC_INDEX 1
-            #define CHAR_DEC_INDEX_OFFSET 5  // Now we only have 5 attributes per characteristic
-
-            // Calculate the index for the data characteristic declaration
-            uint8_t data_char_dec_index = INITIAL_DATA_CHAR_DEC_INDEX + CHAR_DEC_INDEX_OFFSET*(device_id-1);
-
-            // Notify the connected device of the new data value if subscribed
-            if (peripheral_conn && bt_gatt_is_subscribed(peripheral_conn, 
-                                                         &ws_svc.attrs[data_char_dec_index], 
-                                                         BT_GATT_CCC_NOTIFY))
-            {
-                int err = bt_gatt_notify(peripheral_conn, &ws_svc.attrs[data_char_dec_index], 
-                                     &sensor_fixed_values[device_id-1], sizeof(uint32_t));
-                if (err) {
-                    printk("Failed to notify central (err %d)\n", err);
-                }
-            }
-            
-            // Update tracker info
-            if (device_id > 0 && device_id <= NUM_SENSORS) {
-                int idx = device_id - 1;  // Convert to 0-based index
-                sensor_trackers[idx].device_id = device_id;
-                sensor_trackers[idx].data_received = true;
-                sensor_trackers[idx].last_heard_time = k_uptime_get_32();
-                
-                printk("Marked sensor #%d as received\n", device_id);
-                
-                // If we've heard from all sensors and we're in data collection phase,
-                // move to sleep command phase
-                if (operation_phase == PHASE_DATA_COLLECTION && all_sensors_reported()) {
-                    printk("All sensors have reported. Moving to sleep command phase.\n");
-                    
-                    // Cancel the collection timeout timer
-                    k_timer_stop(&collection_timer);
-                    
-                    // Switch to sleep command phase
-                    operation_phase = PHASE_SLEEP_COMMAND;
-                    
-                    // Reset index for sleep commands
-                    next_sleep_cmd_idx = 0;
-                    
-                    // Start sending sleep commands with a short delay
-                    k_timer_start(&sleep_cmd_timer, K_MSEC(500), K_NO_WAIT);
-                }
-            }
-        }
-        else
-        {
-            printk("Invalid data format received\n");
-        }
-
-        // After processing data, turn off LED2
-        k_sleep(K_MSEC(50));  // Brief flash
-        dk_set_led_off(DK_LED2);
-    }
-    else 
-    {
-        printk("Failed to receive response: subevent %d, slot %d\n", info->subevent,
-               info->response_slot);
-    }
-}
-
-// Reset the command to fixed payload request
-static void cmd_reset_timeout(struct k_timer *timer)
-{
-    current_pawr_command = PAWR_CMD_FIXED_PAYLOAD;
-    printk("Reset command to FIXED_PAYLOAD\n");
-}
-
-struct pawr_timing {
-    uint8_t subevent;
-    uint8_t response_slot;
-} __packed;
-
-#define USER_BUTTON DK_BTN1_MSK
-
-static void button_changed(uint32_t button_state, uint32_t has_changed)
-{
-    if (has_changed & USER_BUTTON) {
-        uint32_t user_button_state = button_state & USER_BUTTON;
-
-        if (user_button_state) {
-            printk("Button pressed\n");
-            // No need to toggle commands now as we only have one fixed payload
-        }
-    }
-}
-
-static int init_button(void)
-{
-    int err;
-
-    err = dk_buttons_init(button_changed);
-    if (err) {
-        printk("Cannot init buttons (err: %d)\n", err);
-    }
-
-    return err;
-}
-
-// Check if all sensors have reported or if we've timed out
-static bool all_sensors_reported(void)
-{
-    bool all_reported = true;
-    
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        // If this sensor is active and hasn't reported data, we're not done
-        if (sensor_trackers[i].device_id != 0 && !sensor_trackers[i].data_received) {
-            all_reported = false;
-            break;
-        }
-    }
-    
-    return all_reported;
-}
-
-// Define a custom scan parameter with Coded PHY support
-static const struct bt_le_scan_param scan_param = {
-    .type     = BT_LE_SCAN_TYPE_ACTIVE,
-    .interval = BT_GAP_SCAN_FAST_INTERVAL,
-    .window   = BT_GAP_SCAN_FAST_WINDOW,
-    .options  = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_NO_1M
-};
-
-// Handler for sensor collection timeout
-static void collection_timeout_handler(struct k_timer *timer)
-{
-    printk("Sensor collection timeout reached. Moving to sleep command phase.\n");
-    
-    // Switch to sleep command phase
-    operation_phase = PHASE_SLEEP_COMMAND;
-    
-    // Reset index for sleep commands
-    next_sleep_cmd_idx = 0;
-    
-    // Start sending sleep commands
-    k_timer_start(&sleep_cmd_timer, K_NO_WAIT, K_NO_WAIT);
-}
-
-// Send sleep command to the next sensor that reported data
-static void send_next_sleep_cmd(struct k_timer *timer)
-{
-    bool cmd_sent = false;
-    
-    // Find the next sensor that has reported data
-    while (next_sleep_cmd_idx < NUM_SENSORS && !cmd_sent) {
-        if (sensor_trackers[next_sleep_cmd_idx].data_received) {
-            uint8_t device_id = sensor_trackers[next_sleep_cmd_idx].device_id;
-            
-            printk("Sending sleep command to sensor node #%d\n", device_id);
-            
-            // Change command to sleep request
-            current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
-            
-            // Reset command after a short delay
-            k_timer_start(&cmd_reset_timer, K_MSEC(300), K_NO_WAIT);
-            
-            cmd_sent = true;
-        }
-        
-        next_sleep_cmd_idx++;
-    }
-    
-    // If we've sent a command, schedule the next one
-    if (cmd_sent && next_sleep_cmd_idx < NUM_SENSORS) {
-        k_timer_start(&sleep_cmd_timer, K_MSEC(SLEEP_CMD_INTERVAL_MS), K_NO_WAIT);
-    } else {
-        // We're done sending sleep commands, reset to data collection phase
-        printk("All sleep commands sent. Waiting for sensors to wake up in %d seconds.\n", 
-               SENSOR_SLEEP_DURATION_S);
-        
-        // Reset all tracker data for next cycle
-        for (int i = 0; i < NUM_SENSORS; i++) {
-            sensor_trackers[i].data_received = false;
-        }
-        
-        // Return to data collection phase
-        operation_phase = PHASE_DATA_COLLECTION;
-        
-        // Start the collection timer again after the sleep period + margin
-        k_timer_start(&collection_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S + 2), K_NO_WAIT);
-    }
-}
-
-// Initialize the sensor trackers
-static void init_sensor_trackers(void)
-{
-    // For simplicity, we pre-populate the device IDs
-    // In a real implementation, you might discover these dynamically
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        sensor_trackers[i].device_id = i + 1;  // Device IDs are 1-based
-        sensor_trackers[i].data_received = false;
-        sensor_trackers[i].last_heard_time = 0;
-    }
-    
-    // Start in data collection phase
-    operation_phase = PHASE_DATA_COLLECTION;
-    
-    // Start the collection timer
-    k_timer_start(&collection_timer, K_MSEC(SENSOR_COLLECTION_TIMEOUT_MS), K_NO_WAIT);
-}
-
 int main(void)
 {
     int err;
     struct bt_le_ext_adv *pawr_adv;
     struct bt_gatt_discover_params discover_params;
     struct bt_gatt_write_params write_params;
-    struct pawr_timing sync_config;
+    struct pawr_timing sync_config = {0};  // Initialize with zeros
 
     init_bufs();
     init_button();
@@ -799,18 +964,79 @@ int main(void)
         printk("Failed to start extended advertising (err %d)\n", err);
         return 0;
     }
+    
+    // Set initial state to scanning and start the collection timer
+    current_state = STATE_SCANNING;
+    k_timer_start(&collection_timer, K_MSEC(SENSOR_COLLECTION_TIMEOUT_MS), K_NO_WAIT);
+
+    printk("----------- Starting main cycle -----------\n");
+    printk("Scanning period: %d ms, Sleep period: %d s\n", 
+           SENSOR_COLLECTION_TIMEOUT_MS, SENSOR_SLEEP_DURATION_S);
 
     while (1) {
-        // Continuously scan for devices
+        // Only scan for devices when in scanning state
+        if (current_state == STATE_SCANNING) {
+            // Try to stop any existing scan first
+            bt_le_scan_stop();
+            
+            // Small delay to ensure controller is ready
+            k_sleep(K_MSEC(50));
+            
+            // Log the start of scanning phase with timestamp
+            printk("\n*** SCAN PHASE START at %u ms ***\n", k_uptime_get_32());
+            
+            // Start with a retry mechanism in case of error
+            int retry_count = 0;
+            bool scan_started = false;
+            
+            while (!scan_started && retry_count < 3) {
         err = bt_le_scan_start(&scan_param, device_found);
         if (err) {
-            printk("Scanning failed to start (err %d)\n", err);
-            return 0;
-        }
-
-        printk("Scanning successfully started\n");
-
-        k_sem_take(&sem_connected, K_FOREVER);
+                    retry_count++;
+                    printk("Scanning failed to start (err %d), retry %d of 3\n", err, retry_count);
+                    k_sleep(K_MSEC(100 * retry_count));
+                } else {
+                    scan_started = true;
+                    printk("Scanning successfully started for %d ms collection period\n", 
+                           SENSOR_COLLECTION_TIMEOUT_MS);
+                }
+            }
+            
+            // If we couldn't start scanning after retries, we'll wait and try again in the next cycle
+            if (!scan_started) {
+                printk("Failed to start scanning after multiple attempts, will retry in next cycle\n");
+                // Move directly to sleep phase
+                current_state = STATE_SLEEPING;
+                k_timer_start(&sleep_cycle_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S), K_NO_WAIT);
+                k_work_schedule(&restart_scan_work, K_SECONDS(SENSOR_SLEEP_DURATION_S));
+                continue;
+            }
+            
+            // Periodically check if we've found any sensors during the scan period
+            int check_count = 0;
+            const int max_checks = 10;
+            bool any_sensor_found = false;
+            
+            // Check every second for up to 10 seconds (if no device connects first)
+            while (check_count < max_checks && !any_sensor_found && central_conn == NULL) {
+                // Check if we've found any sensor so far
+                for (int i = 0; i < NUM_SENSORS; i++) {
+                    if (sensor_trackers[i].data_received) {
+                        any_sensor_found = true;
+                        printk("Found sensor #%d during periodic check\n", i+1);
+                        break;
+                    }
+                }
+                
+                if (!any_sensor_found) {
+                    check_count++;
+                    printk("No sensors found yet, check %d of %d\n", check_count, max_checks);
+                    k_sleep(K_SECONDS(1));
+                }
+            }
+            
+            // Wait for connection or timeout
+            k_sem_take(&sem_connected, check_count < max_checks ? K_FOREVER : K_NO_WAIT);
 
         err = bt_le_per_adv_set_info_transfer(pawr_adv, central_conn, 0);
         if (err) {
@@ -893,7 +1119,12 @@ int main(void)
         }
 
         printk("Disconnected\n");
-        k_sem_take(&sem_disconnected,  K_SECONDS(30));
+            k_sem_take(&sem_disconnected, K_SECONDS(30));
+        } else {
+            // If not in scanning state, we're either sending sleep commands or sleeping
+            // Just wait a bit before checking again
+            k_sleep(K_MSEC(500));
+        }
     }
 
     printk("SHOULD NEVER REACH HERE\n");

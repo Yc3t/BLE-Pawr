@@ -5,6 +5,12 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/sensor.h>
 #include <dk_buttons_and_leds.h>
+#include <zephyr/drivers/uart.h> // Include UART driver
+#include <zephyr/device.h> // For device API
+#include <zephyr/kernel.h> // For k_sleep
+
+// UART device
+static const struct device *uart_dev;
 
 // UNCOMMENT for low power mode
 //#define LOW_POWER_MODE
@@ -19,8 +25,8 @@
 
 #define NUM_SENSORS 3
 
-// Sensor variables
-static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
+// Sensor variables - removed as we now store in the sensor_tracker_t
+// static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
 
 // 9 bytes: 1 byte for length, 1 byte for type, 2 bytes for company ID, 1 byte for device ID, 4 bytes for fixed payload
 #define RESPONSE_DATA_SIZE 9
@@ -45,6 +51,8 @@ typedef struct {
     uint8_t response_count;    // Number of responses received this cycle (up to 10)
     uint32_t last_heard_time;  // Last time we heard from this sensor
     uint8_t device_id;         // Device ID of the sensor
+    int8_t rssi;               // RSSI value for this sensor
+    uint32_t payloads[10];     // Store all 10 payloads
 } sensor_tracker_t;
 
 // Tracker array for all sensors
@@ -78,12 +86,13 @@ static int next_sleep_cmd_idx = 0;
 // Sleep duration command - all sensors will be told to sleep for this time
 #define SENSOR_SLEEP_DURATION_S 60 // Use 60 seconds (1 minute) for sleep
 
-// Forward declarations for all functions that are used before being defined
+// Add forward declaration at the top with other forward declarations
 static void cmd_reset_timeout(struct k_timer *timer);
 static void collection_timeout_handler(struct k_timer *timer);
 static void send_next_sleep_cmd(struct k_timer *timer);
 static bool all_sensors_reported(void);
 static void init_sensor_trackers(void);
+static void send_sensor_report_via_uart(void);
 
 // Add a timer to reset the command back to fixed payload
 K_TIMER_DEFINE(cmd_reset_timer, cmd_reset_timeout, NULL);
@@ -406,6 +415,7 @@ static void init_sensor_trackers(void)
         sensor_trackers[i].data_received = false;
         sensor_trackers[i].response_count = 0; // Reset response count
         sensor_trackers[i].last_heard_time = 0;
+        sensor_trackers[i].rssi = 0;
     }
     
     // Start in data collection phase
@@ -437,7 +447,7 @@ static void collection_timeout_handler(struct k_timer *timer)
     k_timer_start(&sleep_cmd_timer, K_NO_WAIT, K_NO_WAIT);
 }
 
-// Update send_next_sleep_cmd to transition to SLEEPING state
+// Update send_next_sleep_cmd to transition to SLEEPING state and send report
 static void send_next_sleep_cmd(struct k_timer *timer)
 {
     bool cmd_sent = false;
@@ -475,6 +485,10 @@ static void send_next_sleep_cmd(struct k_timer *timer)
         
         // Enter sleeping state - we'll ignore new sensors during this time
         current_state = STATE_SLEEPING;
+        
+        // Send collected sensor data report via UART
+        printk("Sending collected sensor data report via UART...\n");
+        send_sensor_report_via_uart();
         
         // Start a timer for the sleep period
         k_timer_start(&sleep_cycle_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S), K_NO_WAIT);
@@ -602,16 +616,19 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
                         printk("\t---- SENSOR NODE #%d (Response %d/10) ----\n\tFixed Payload: 0x%08X\n", 
                                device_id, sensor_trackers[idx].response_count, fixed_payload);
                         
-                        // Store the received value (can be overwritten by subsequent responses)
-                        sensor_fixed_values[idx] = fixed_payload;
+                        // Store the received value in the corresponding slot
+                        sensor_trackers[idx].payloads[sensor_trackers[idx].response_count - 1] = fixed_payload;
 
                         // Mark data as received (at least once)
                         sensor_trackers[idx].data_received = true; 
                         sensor_trackers[idx].device_id = device_id; // Ensure device ID is set
                         sensor_trackers[idx].last_heard_time = k_uptime_get_32();
                         
-                        printk("Marked sensor #%d as received (response %d/10)\n", 
-                               device_id, sensor_trackers[idx].response_count);
+                        // Store RSSI value from response info
+                        sensor_trackers[idx].rssi = info->rssi;
+                        
+                        printk("Marked sensor #%d as received (response %d/10, RSSI: %d)\n", 
+                               device_id, sensor_trackers[idx].response_count, info->rssi);
                         
                         // If we've heard from all sensors (10 times each) and we're in data collection phase,
                         // move to sleep command phase
@@ -746,7 +763,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         // but with a small delay to allow the controller to reset
         k_sleep(K_MSEC(100));
         err = bt_le_scan_start(&scan_param, device_found);
-        if (err) {
+    if (err) {
             printk("Failed to restart scanning after connection failure (err %d)\n", err);
         }
     } else {
@@ -766,17 +783,17 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 static ssize_t read_sensor_1_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_fixed_values[0], sizeof(uint32_t));
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[0].payloads[0], sizeof(uint32_t));
 }
 
 static ssize_t read_sensor_2_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_fixed_values[1], sizeof(uint32_t));
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[1].payloads[0], sizeof(uint32_t));
 }
 
 static ssize_t read_sensor_3_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_fixed_values[2], sizeof(uint32_t));
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[2].payloads[0], sizeof(uint32_t));
 }
 
 // Format for the fixed data characteristic
@@ -832,7 +849,7 @@ BT_GATT_SERVICE_DEFINE(
                     BT_GATT_PERM_READ,
                     read_sensor_1_data,
                     NULL,
-                    &sensor_fixed_values[0]),
+                    &sensor_trackers[0].payloads[0]),
     BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     BT_GATT_CPF(&fixed_data_cpf),
     BT_GATT_CUD(SENSOR_1_DATA_DESCRIPTION, BT_GATT_PERM_READ),
@@ -843,7 +860,7 @@ BT_GATT_SERVICE_DEFINE(
                     BT_GATT_PERM_READ,
                     read_sensor_2_data,
                     NULL,
-                    &sensor_fixed_values[1]),
+                    &sensor_trackers[1].payloads[0]),
     BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),    
     BT_GATT_CPF(&fixed_data_cpf),
     BT_GATT_CUD(SENSOR_2_DATA_DESCRIPTION, BT_GATT_PERM_READ),
@@ -854,7 +871,7 @@ BT_GATT_SERVICE_DEFINE(
                     BT_GATT_PERM_READ,
                     read_sensor_3_data,
                     NULL,
-                    &sensor_fixed_values[2]),
+                    &sensor_trackers[2].payloads[0]),
     BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     BT_GATT_CPF(&fixed_data_cpf),
     BT_GATT_CUD(SENSOR_3_DATA_DESCRIPTION, BT_GATT_PERM_READ),
@@ -900,6 +917,110 @@ static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_dat
     }
 }
 
+// Static variable to keep track of sequence number
+static uint32_t report_sequence = 0;
+
+// Fix UART init function
+static int uart_init(void)
+{
+    uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    if (!device_is_ready(uart_dev)) {
+        printk("UART device not found or not ready\n");
+        return -1;
+    }
+    
+    return 0;
+}
+
+// Function to send a byte array over UART
+static void uart_send_data(uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        uart_poll_out(uart_dev, data[i]);
+    }
+}
+
+// Function to send the report via UART
+static void send_sensor_report_via_uart(void)
+{
+    // Count active sensors
+    uint32_t active_sensors = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_trackers[i].data_received) {
+            active_sensors++;
+        }
+    }
+    
+    // Header size: 4 (magic) + 4 (nseq) + 4 (n_sensors)
+    // Sensor data size: For each sensor: 1 (ID) + 1 (RSSI) + 1 (n_messages) + (4 * n_messages)
+    // Calculate total buffer size needed
+    size_t total_size = 12; // Header size
+    
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_trackers[i].data_received) {
+            total_size += 3; // ID, RSSI, n_messages
+            total_size += (sensor_trackers[i].response_count * 4); // 4 bytes per payload
+        }
+    }
+    
+    // Allocate buffer for the entire report
+    uint8_t *report_buffer = k_malloc(total_size);
+    if (!report_buffer) {
+        printk("Failed to allocate memory for report\n");
+        return;
+    }
+    
+    // Fill the buffer with header data
+    uint32_t magic = 0x55555555; // Magic header
+    memcpy(&report_buffer[0], &magic, 4);
+    memcpy(&report_buffer[4], &report_sequence, 4);
+    memcpy(&report_buffer[8], &active_sensors, 4);
+    
+    // Increment sequence number for next report
+    report_sequence++;
+    
+    // Current position in buffer
+    size_t pos = 12;
+    
+    // Fill sensor data
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_trackers[i].data_received) {
+            // Sensor ID
+            report_buffer[pos++] = sensor_trackers[i].device_id;
+            
+            // RSSI (convert to uint8_t for simplicity)
+            report_buffer[pos++] = (uint8_t)sensor_trackers[i].rssi;
+            
+            // Number of messages
+            report_buffer[pos++] = sensor_trackers[i].response_count;
+            
+            // Payload data for each message
+            for (int j = 0; j < sensor_trackers[i].response_count; j++) {
+                memcpy(&report_buffer[pos], &sensor_trackers[i].payloads[j], 4);
+                pos += 4;
+            }
+            
+            printk("Added sensor %d with %d messages to report\n", 
+                   sensor_trackers[i].device_id, sensor_trackers[i].response_count);
+        }
+    }
+    
+    // Send the entire report via UART
+    uart_send_data(report_buffer, total_size);
+    printk("Sent sensor report via UART: %d bytes, %d sensors\n", total_size, active_sensors);
+    
+    // Hexdump first 32 bytes of the report for debugging
+    printk("Report header (hex): ");
+    for (int i = 0; i < MIN(32, total_size); i++) {
+        printk("%02X ", report_buffer[i]);
+        if ((i + 1) % 16 == 0) printk("\n");
+    }
+    printk("\n");
+    
+    // Free the buffer
+    k_free(report_buffer);
+}
+
 int main(void)
 {
     int err;
@@ -911,6 +1032,14 @@ int main(void)
     init_bufs();
     init_button();
     init_sensor_trackers();  // Initialize sensor tracking
+    
+    // Initialize UART
+    err = uart_init();
+    if (err) {
+        printk("UART init failed (err: %d)\n", err);
+    } else {
+        printk("UART initialized successfully\n");
+    }
     
     // Initialize LEDs
     err = dk_leds_init();

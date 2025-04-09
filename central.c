@@ -17,24 +17,17 @@ static const struct device *uart_dev;
 
 #ifdef LOW_POWER_MODE
 #define PA_INTERVAL 0x320 // 1 second
-#define SUBEVENT_INTERVAL 0xF0 // 300 ms  
+#define SUBEVENT_INTERVAL 0x190 // 400 ms - increased for 6 sensors
 #else
-#define PA_INTERVAL 0xFF // 318.75 ms
-#define SUBEVENT_INTERVAL 0x50 // 100 ms
+#define PA_INTERVAL 0x120 // 450 ms - increased for 6 sensors
+#define SUBEVENT_INTERVAL 0x80 // 160 ms - increased for 6 sensors
 #endif
 
-#define NUM_SENSORS 3
-
-// Sensor variables - removed as we now store in the sensor_tracker_t
-// static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
-
-// 9 bytes: 1 byte for length, 1 byte for type, 2 bytes for company ID, 1 byte for device ID, 4 bytes for fixed payload
-#define RESPONSE_DATA_SIZE 9
-
 // We will be assigning each sensor node a subevent and response slot
-// We will have a maximum of 3 sensor nodes
+// We will have a maximum of 6 sensor nodes
+#define NUM_SENSORS 6
 #define NUM_RSP_SLOTS 1
-#define NUM_SUBEVENTS NUM_SENSORS
+#define NUM_SUBEVENTS 6
 #define PACKET_SIZE   5
 #define NAME_LEN      30
 
@@ -44,6 +37,12 @@ static const struct device *uart_dev;
 // PAwR command definitions
 #define PAWR_CMD_FIXED_PAYLOAD 0x01
 #define PAWR_CMD_SLEEP_REQUEST 0x02
+
+// Sensor variables - removed as we now store in the sensor_tracker_t
+// static uint32_t sensor_fixed_values[NUM_SENSORS] = {0};
+
+// 9 bytes: 1 byte for length, 1 byte for type, 2 bytes for company ID, 1 byte for device ID, 4 bytes for fixed payload
+#define RESPONSE_DATA_SIZE 9
 
 // Define a structure to track sensor data collection
 typedef struct {
@@ -59,7 +58,7 @@ typedef struct {
 static sensor_tracker_t sensor_trackers[NUM_SENSORS] = {0};
 
 // Timeout for waiting for all sensors (in ms)
-#define SENSOR_COLLECTION_TIMEOUT_MS 30000 // Use 30 seconds for scanning (increased from 10 seconds)
+#define SENSOR_COLLECTION_TIMEOUT_MS 20000 // Reduced from 30 seconds to 20 seconds
 
 // Flag to indicate if we're in data collection phase or sleep command phase
 static enum {
@@ -129,13 +128,13 @@ static struct bt_uuid_128 pawr_char_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1));
 static uint16_t pawr_attr_handle;
 static const struct bt_le_per_adv_param per_adv_params = {
-    .interval_min = PA_INTERVAL,
-    .interval_max = PA_INTERVAL,
+    .interval_min = 0x320, // 1 second - reduced from 3 seconds for faster cycles
+    .interval_max = 0x320, // Same as interval_min
     .options = 0, // No options
-    .num_subevents = NUM_SUBEVENTS, // 3
-    .subevent_interval = SUBEVENT_INTERVAL,
-    .response_slot_delay = 0x5, // 6.25 ms
-    .response_slot_spacing = 0xFA, // 31.25 ms
+    .num_subevents = 6, // Updated to 6 subevents for 6 sensors
+    .subevent_interval = 0x50, // 80 ms - reduced for faster cycles
+    .response_slot_delay = 0x08, // 10 ms - reduced for faster response time
+    .response_slot_spacing = 0x30, // 60 ms - reduced for faster cycles
     .num_response_slots = NUM_RSP_SLOTS, // 1
 };
 
@@ -147,9 +146,9 @@ static const struct bt_data ad[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN)
 };
 
-static struct bt_le_per_adv_subevent_data_params subevent_data_params[NUM_SUBEVENTS];
-static struct net_buf_simple bufs[NUM_SUBEVENTS];
-static uint8_t backing_store[NUM_SUBEVENTS][PACKET_SIZE];
+static struct bt_le_per_adv_subevent_data_params subevent_data_params[6]; // Updated to 6
+static struct net_buf_simple bufs[6]; // Updated to 6
+static uint8_t backing_store[6][PACKET_SIZE]; // Updated to 6
 
 BUILD_ASSERT(ARRAY_SIZE(bufs) == ARRAY_SIZE(subevent_data_params));
 BUILD_ASSERT(ARRAY_SIZE(backing_store) == ARRAY_SIZE(subevent_data_params));
@@ -307,7 +306,7 @@ static const struct bt_le_scan_param scan_param = {
     .type     = BT_LE_SCAN_TYPE_ACTIVE,
     .interval = BT_GAP_SCAN_FAST_INTERVAL,
     .window   = BT_GAP_SCAN_FAST_WINDOW,
-    .options  = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_NO_1M
+    .options  = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_FILTER_DUPLICATE
 };
 
 // Forward declare device_found
@@ -450,71 +449,120 @@ static void collection_timeout_handler(struct k_timer *timer)
 // Update send_next_sleep_cmd to transition to SLEEPING state and send report
 static void send_next_sleep_cmd(struct k_timer *timer)
 {
+    static int sleep_cmd_retries = 0;
+    static bool retry_in_progress = false;
     bool cmd_sent = false;
+    int active_sensors = 0;
+    
+    // Count how many active sensors we have
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_trackers[i].data_received) {
+            active_sensors++;
+        }
+    }
+    
+    // If no active sensors, just finish the process
+    if (active_sensors == 0) {
+        printk("No active sensors found, skipping sleep commands\n");
+        goto finalize_sleep;
+    }
+    
+    printk("Sending sleep commands - processing index %d of %d sensors (%d active sensors, retry %d)\n", 
+           next_sleep_cmd_idx, NUM_SENSORS, active_sensors, sleep_cmd_retries);
     
     // Find the next sensor that has reported data
     while (next_sleep_cmd_idx < NUM_SENSORS && !cmd_sent) {
         if (sensor_trackers[next_sleep_cmd_idx].data_received) {
             uint8_t device_id = sensor_trackers[next_sleep_cmd_idx].device_id;
             
+            // Send the sleep command to this sensor
             printk("Sending sleep command to sensor node #%d\n", device_id);
             
             // Change command to sleep request
             current_pawr_command = PAWR_CMD_SLEEP_REQUEST;
             
-            // Reset command after a short delay
-            k_timer_start(&cmd_reset_timer, K_MSEC(300), K_NO_WAIT);
+            // Reset command after a short delay - make this longer to ensure it's received
+            k_timer_start(&cmd_reset_timer, K_MSEC(500), K_NO_WAIT);
             
             cmd_sent = true;
+        } else {
+            printk("Sensor at index %d has no data, skipping\n", next_sleep_cmd_idx);
         }
         
         next_sleep_cmd_idx++;
     }
     
-    // If we've sent a command, schedule the next one with a short delay
-    if (cmd_sent && next_sleep_cmd_idx < NUM_SENSORS) {
+    // If we've processed all sensors in this pass
+    if (next_sleep_cmd_idx >= NUM_SENSORS) {
+        if (sleep_cmd_retries < 2) {  // Do a total of 3 passes (0, 1, 2)
+            sleep_cmd_retries++;
+            next_sleep_cmd_idx = 0;  // Reset to start
+            printk("Retry #%d: All sensors processed, starting another pass\n", sleep_cmd_retries);
+            k_timer_start(&sleep_cmd_timer, K_MSEC(SLEEP_CMD_INTERVAL_MS), K_NO_WAIT);
+            return;
+        } else {
+            // We've completed all retries, finalize the process
+            printk("Completed %d retries of sleep commands. Finalizing sleep process.\n", 
+                  sleep_cmd_retries + 1);
+            goto finalize_sleep;
+        }
+    } else if (cmd_sent) {
+        // We sent a command and have more sensors to process
+        // Schedule the next sleep command with a delay
         k_timer_start(&sleep_cmd_timer, K_MSEC(SLEEP_CMD_INTERVAL_MS), K_NO_WAIT);
-    } else {
-        // Record the exact time we finish sending all sleep commands
-        // This will be our reference for calculating the true sleep duration
-        uint32_t sleep_start_time = k_uptime_get_32();
-        
-        // We're done sending sleep commands, enter full sleep mode
-        printk("All sleep commands sent at timestamp %u ms. Entering sleep period for %d seconds.\n", 
-               sleep_start_time, SENSOR_SLEEP_DURATION_S);
-        
-        // Enter sleeping state - we'll ignore new sensors during this time
-        current_state = STATE_SLEEPING;
-        
-        // Send collected sensor data report via UART
-        printk("Sending collected sensor data report via UART...\n");
-        send_sensor_report_via_uart();
-        
-        // Start a timer for the sleep period
-        k_timer_start(&sleep_cycle_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S), K_NO_WAIT);
-        
-        // Calculate a more accurate wake time to ensure sync with sensors
-        // We want to wake up slightly before the sensors do, so we can be ready to scan
-        // when they start advertising
-        uint32_t elapsed_ms = k_uptime_get_32() - sleep_start_time;
-        uint32_t adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000) - elapsed_ms;
-        
-        // Ensure we don't schedule with negative time
-        if (adjusted_sleep_ms > (SENSOR_SLEEP_DURATION_S * 1000)) {
-            adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000);
-        }
-        
-        // Wake up 500ms before the sensors should wake up
-        if (adjusted_sleep_ms > 500) {
-            adjusted_sleep_ms -= 500;
-        }
-        
-        printk("Scheduling wake-up in %u ms (adjusted for command transmission time)\n", 
-               adjusted_sleep_ms);
-        
-        // When sleep period is over, we'll start scanning again
-        k_work_schedule(&restart_scan_work, K_MSEC(adjusted_sleep_ms));
+        return;
     }
+    
+finalize_sleep:
+    // Reset state for next cycle
+    sleep_cmd_retries = 0;
+    next_sleep_cmd_idx = 0;
+    
+    // Record the exact time we finish sending all sleep commands
+    uint32_t sleep_start_time = k_uptime_get_32();
+    
+    // We're done sending sleep commands, enter full sleep mode
+    printk("All sleep commands sent at timestamp %u ms. Entering sleep period for %d seconds.\n", 
+           sleep_start_time, SENSOR_SLEEP_DURATION_S);
+    
+    // Log which sensors received sleep commands
+    printk("Sleep commands sent to sensors: [");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_trackers[i].data_received) {
+            printk("%s%d", i > 0 ? ", " : "", i+1);
+        }
+    }
+    printk("]\n");
+    
+    // Enter sleeping state - we'll ignore new sensors during this time
+    current_state = STATE_SLEEPING;
+    
+    // Send collected sensor data report via UART
+    printk("Sending collected sensor data report via UART...\n");
+    send_sensor_report_via_uart();
+    
+    // Start a timer for the sleep period
+    k_timer_start(&sleep_cycle_timer, K_SECONDS(SENSOR_SLEEP_DURATION_S), K_NO_WAIT);
+    
+    // Calculate a more accurate wake time to ensure sync with sensors
+    uint32_t elapsed_ms = k_uptime_get_32() - sleep_start_time;
+    uint32_t adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000) - elapsed_ms;
+    
+    // Ensure we don't schedule with negative time
+    if (adjusted_sleep_ms > (SENSOR_SLEEP_DURATION_S * 1000)) {
+        adjusted_sleep_ms = (SENSOR_SLEEP_DURATION_S * 1000);
+    }
+    
+    // Wake up 500ms before the sensors should wake up
+    if (adjusted_sleep_ms > 500) {
+        adjusted_sleep_ms -= 500;
+    }
+    
+    printk("Scheduling wake-up in %u ms (adjusted for command transmission time)\n", 
+           adjusted_sleep_ms);
+    
+    // When sleep period is over, we'll start scanning again
+    k_work_schedule(&restart_scan_work, K_MSEC(adjusted_sleep_ms));
 }
 
 // Improve the restart_scan_handler function for better synchronization
@@ -585,11 +633,47 @@ static void restart_scan_handler(struct k_work *work)
 static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response_info *info,
              struct net_buf_simple *buf)
 {
+    static uint32_t total_responses_received = 0;
+    static uint32_t last_progress_update = 0;
+    uint32_t current_time;
+    
     if (buf) {
         // Turn on LED2 to indicate data reception
         dk_set_led_on(DK_LED2);
 
-        printk("\nReceived Response in Subevent #%d, Response Slot #%d [Data length = %d bytes]\n", info->subevent, info->response_slot, buf->len);
+        total_responses_received++;
+        current_time = k_uptime_get_32();
+        
+        // Print periodic progress summary (every 10 responses or 5 seconds)
+        if (total_responses_received % 10 == 0 || 
+            (current_time - last_progress_update) > 5000) {
+            
+            // Count total expected responses (10 per sensor)
+            int total_expected = NUM_SENSORS * 10;
+            int total_received = 0;
+            
+            // Count how many responses we've received across all sensors
+            for (int i = 0; i < NUM_SENSORS; i++) {
+                total_received += sensor_trackers[i].response_count;
+            }
+            
+            // Print progress summary
+            printk("\n----- DATA COLLECTION PROGRESS: %d/%d responses (%d%%) -----\n", 
+                   total_received, total_expected,
+                   (total_received * 100) / (total_expected > 0 ? total_expected : 1));
+            
+            // Print per-sensor progress
+            printk("Per-sensor progress: [");
+            for (int i = 0; i < NUM_SENSORS; i++) {
+                printk("%s%d/10", i > 0 ? ", " : "", sensor_trackers[i].response_count);
+            }
+            printk("]\n");
+            
+            last_progress_update = current_time;
+        }
+
+        printk("\nReceived Response in Subevent #%d, Response Slot #%d [Data length = %d bytes]\n", 
+               info->subevent, info->response_slot, buf->len);
 
         // Only process responses when in scanning state
         if (current_state == STATE_SCANNING) {
@@ -602,8 +686,8 @@ static void response_cb(struct bt_le_ext_adv *adv, struct bt_le_per_adv_response
                 uint8_t device_id = buf->data[4];
                 uint32_t fixed_payload = *(uint32_t *)&(buf->data[5]);
 
-                // Check if sensor ID is valid
-                if (device_id > 0 && device_id <= NUM_SENSORS) {
+                // Check if sensor ID is valid - updated for 6 sensors
+                if (device_id > 0 && device_id <= 6) {
                     int idx = device_id - 1;  // Convert to 0-based index
 
                     // Check if we have already received 10 responses from this sensor
@@ -693,6 +777,9 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     int err;
     char addr_str[BT_ADDR_LE_STR_LEN];
     custom_adv_data_t device_ad_data;
+    static uint8_t attempted_devices[NUM_SENSORS] = {0};
+    static uint8_t connection_attempts = 0;
+    bool should_connect = false;
 
     // Skip device processing if we're not in scanning state
     if (current_state != STATE_SCANNING) {
@@ -704,8 +791,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    // Print out the advertisement type for debugging
-    printk("Advertisement type: 0x%02X\n", type);
+    // Convert the address to string for logging
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 
     /* Accept both regular and extended advertising */
     if (type != BT_GAP_ADV_TYPE_ADV_IND && 
@@ -721,56 +808,80 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    printk("Device found: %s (RSSI %d)\n", device_ad_data.name, rssi);
-    printk("Manufacturer specific data [Novel Bits]. ID = 0x%02X\n", device_ad_data.data[2]);
-
-    if (device_ad_data.data[2] > NUM_SENSORS) {
-        printk("Invalid device ID\n");
+    // Check if this is a valid sensor ID
+    uint8_t device_id = device_ad_data.data[2];
+    if (device_id == 0 || device_id > NUM_SENSORS) {
+        printk("Invalid device ID %d\n", device_id);
         return;
     }
 
-    // Try to stop scanning, but handle failure gracefully
-    err = bt_le_scan_stop();
-    if (err) {
-        printk("Failed to stop scanning (err %d), will try again\n", err);
+    printk("Device found: %s (RSSI %d)\n", device_ad_data.name, rssi);
+    printk("Manufacturer specific data [Novel Bits]. ID = 0x%02X\n", device_id);
+
+    // Check if we've already attempted to connect to this device in this scan cycle
+    if (attempted_devices[device_id - 1] == 0) {
+        should_connect = true;
+        attempted_devices[device_id - 1] = 1;
+        connection_attempts++;
         
-        // Try briefly waiting and stopping again
-        k_sleep(K_MSEC(50));
-        err = bt_le_scan_stop();
-        
-    if (err) {
-            printk("Still failed to stop scanning (err %d), continuing anyway\n", err);
-            // We'll continue despite the error
+        // Log which sensors we've tried to discover
+        printk("Discovery progress: [");
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            printk("%s%d", i > 0 ? ", " : "", attempted_devices[i]);
         }
+        printk("]\n");
+    } else {
+        printk("Already attempted connection to device ID %d in this cycle, skipping\n", device_id);
+        return;
     }
 
-    // Convert the address to string for logging
-    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-
-    // Create extended advertising connection parameters with Coded PHY
-    struct bt_conn_le_create_param *conn_params = 
-        BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,
-                               BT_GAP_SCAN_FAST_INTERVAL,
-                               BT_GAP_SCAN_FAST_INTERVAL);
-
-    err = bt_conn_le_create(addr, conn_params,
-                BT_LE_CONN_PARAM_DEFAULT,
-                &central_conn);
-    if (err) {
-        printk("Create conn to %s failed (%d)\n", addr_str, err);
-        
-        // If connection creation fails, we should restart scanning
-        // but with a small delay to allow the controller to reset
-        k_sleep(K_MSEC(100));
-        err = bt_le_scan_start(&scan_param, device_found);
-    if (err) {
-            printk("Failed to restart scanning after connection failure (err %d)\n", err);
+    // If we should connect to this device
+    if (should_connect) {
+        // Try to stop scanning, but handle failure gracefully
+        err = bt_le_scan_stop();
+        if (err) {
+            printk("Failed to stop scanning (err %d), will try again\n", err);
+            
+            // Try briefly waiting and stopping again
+            k_sleep(K_MSEC(50));
+            err = bt_le_scan_stop();
+            
+            if (err) {
+                printk("Still failed to stop scanning (err %d), continuing anyway\n", err);
+            }
         }
-    } else {
-        // Successfully initiated connection
-        currently_connected_device_id = device_ad_data.data[2];
-        printk("Connecting to device ID %d at %s\n", 
-               currently_connected_device_id, addr_str);
+
+        // Create extended advertising connection parameters with Coded PHY
+        struct bt_conn_le_create_param *conn_params = 
+            BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED,
+                                  BT_GAP_SCAN_FAST_INTERVAL,
+                                  BT_GAP_SCAN_FAST_INTERVAL);
+
+        // Store current device ID before connection attempt
+        currently_connected_device_id = device_id;
+        
+        printk("Connecting to device ID %d at %s\n", device_id, addr_str);
+        err = bt_conn_le_create(addr, conn_params, BT_LE_CONN_PARAM_DEFAULT, &central_conn);
+        
+        if (err) {
+            printk("Create conn to %s failed (%d)\n", addr_str, err);
+            currently_connected_device_id = 0xFF;
+            central_conn = NULL;
+            
+            // If connection creation fails, restart scanning immediately
+            k_sleep(K_MSEC(100));
+            err = bt_le_scan_start(&scan_param, device_found);
+            if (err) {
+                printk("Failed to restart scanning after connection failure (err %d)\n", err);
+            }
+        }
+        
+        // Reset attempted devices array if we've tried all expected sensors
+        if (connection_attempts >= NUM_SENSORS) {
+            printk("Attempted connections to all %d sensors, resetting tracking\n", NUM_SENSORS);
+            memset(attempted_devices, 0, sizeof(attempted_devices));
+            connection_attempts = 0;
+        }
     }
 }
 
@@ -780,6 +891,9 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 #define SENSOR_1_DATA_DESCRIPTION "Sensor 1 Data"
 #define SENSOR_2_DATA_DESCRIPTION "Sensor 2 Data"
 #define SENSOR_3_DATA_DESCRIPTION "Sensor 3 Data"
+#define SENSOR_4_DATA_DESCRIPTION "Sensor 4 Data"
+#define SENSOR_5_DATA_DESCRIPTION "Sensor 5 Data"
+#define SENSOR_6_DATA_DESCRIPTION "Sensor 6 Data"
 
 static ssize_t read_sensor_1_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
@@ -794,6 +908,21 @@ static ssize_t read_sensor_2_data(struct bt_conn *conn, const struct bt_gatt_att
 static ssize_t read_sensor_3_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
     return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[2].payloads[0], sizeof(uint32_t));
+}
+
+static ssize_t read_sensor_4_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[3].payloads[0], sizeof(uint32_t));
+}
+
+static ssize_t read_sensor_5_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[4].payloads[0], sizeof(uint32_t));
+}
+
+static ssize_t read_sensor_6_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &sensor_trackers[5].payloads[0], sizeof(uint32_t));
 }
 
 // Format for the fixed data characteristic
@@ -819,6 +948,18 @@ static struct bt_uuid_128 ws_sensor_2_data_char_uuid =
 static struct bt_uuid_128 ws_sensor_3_data_char_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef5));
 
+// Sensor 4 Data: 12345678-1234-5678-1234-56789abcdef6
+static struct bt_uuid_128 ws_sensor_4_data_char_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef6));
+
+// Sensor 5 Data: 12345678-1234-5678-1234-56789abcdef7
+static struct bt_uuid_128 ws_sensor_5_data_char_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef7));
+
+// Sensor 6 Data: 12345678-1234-5678-1234-56789abcdef8
+static struct bt_uuid_128 ws_sensor_6_data_char_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef8));
+
 // --- Weather Station Service ---
 // The handles are in the following sequence:
 // [0] Weather Station Service
@@ -837,6 +978,21 @@ static struct bt_uuid_128 ws_sensor_3_data_char_uuid =
 // [13] Sensor 3 Data characteristic client configuration descriptor (CCC)
 // [14] Sensor 3 Data characteristic presentation format descriptor (CPF)
 // [15] Sensor 3 Data characteristic user description (CUD)
+// [16] Sensor 4 Data characteristic declaration
+// [17] Sensor 4 Data characteristic value
+// [18] Sensor 4 Data characteristic client configuration descriptor (CCC)
+// [19] Sensor 4 Data characteristic presentation format descriptor (CPF)
+// [20] Sensor 4 Data characteristic user description (CUD)
+// [21] Sensor 5 Data characteristic declaration
+// [22] Sensor 5 Data characteristic value
+// [23] Sensor 5 Data characteristic client configuration descriptor (CCC)
+// [24] Sensor 5 Data characteristic presentation format descriptor (CPF)
+// [25] Sensor 5 Data characteristic user description (CUD)
+// [26] Sensor 6 Data characteristic declaration
+// [27] Sensor 6 Data characteristic value
+// [28] Sensor 6 Data characteristic client configuration descriptor (CCC)
+// [29] Sensor 6 Data characteristic presentation format descriptor (CPF)
+// [30] Sensor 6 Data characteristic user description (CUD)
 BT_GATT_SERVICE_DEFINE(
     ws_svc,
     
@@ -875,6 +1031,39 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     BT_GATT_CPF(&fixed_data_cpf),
     BT_GATT_CUD(SENSOR_3_DATA_DESCRIPTION, BT_GATT_PERM_READ),
+
+    // Sensor 4 Data Characteristic [16, 17]
+    BT_GATT_CHARACTERISTIC(&ws_sensor_4_data_char_uuid.uuid,
+                    BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_READ,
+                    BT_GATT_PERM_READ,
+                    read_sensor_4_data,
+                    NULL,
+                    &sensor_trackers[3].payloads[0]),
+    BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CPF(&fixed_data_cpf),
+    BT_GATT_CUD(SENSOR_4_DATA_DESCRIPTION, BT_GATT_PERM_READ),
+
+    // Sensor 5 Data Characteristic [20, 21]
+    BT_GATT_CHARACTERISTIC(&ws_sensor_5_data_char_uuid.uuid,
+                    BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_READ,
+                    BT_GATT_PERM_READ,
+                    read_sensor_5_data,
+                    NULL,
+                    &sensor_trackers[4].payloads[0]),
+    BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CPF(&fixed_data_cpf),
+    BT_GATT_CUD(SENSOR_5_DATA_DESCRIPTION, BT_GATT_PERM_READ),
+
+    // Sensor 6 Data Characteristic [24, 25]
+    BT_GATT_CHARACTERISTIC(&ws_sensor_6_data_char_uuid.uuid,
+                    BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_READ,
+                    BT_GATT_PERM_READ,
+                    read_sensor_6_data,
+                    NULL,
+                    &sensor_trackers[5].payloads[0]),
+    BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CPF(&fixed_data_cpf),
+    BT_GATT_CUD(SENSOR_6_DATA_DESCRIPTION, BT_GATT_PERM_READ),
 );
 
 // Response data format
@@ -905,7 +1094,7 @@ static void request_cb(struct bt_le_ext_adv *adv, const struct bt_le_per_adv_dat
         buf->data[buf->len - 1] = current_pawr_command;
 
         subevent_data_params[i].subevent =
-            (request->start + i) % per_adv_params.num_subevents;
+            (request->start + i) % 6; // Updated to 6 subevents
         subevent_data_params[i].response_slot_start = 0;
         subevent_data_params[i].response_slot_count = NUM_RSP_SLOTS;
         subevent_data_params[i].data = buf;
@@ -923,7 +1112,7 @@ static uint32_t report_sequence = 0;
 // Fix UART init function
 static int uart_init(void)
 {
-    uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart0));
     if (!device_is_ready(uart_dev)) {
         printk("UART device not found or not ready\n");
         return -1;
@@ -1143,25 +1332,64 @@ int main(void)
             
             // Periodically check if we've found any sensors during the scan period
             int check_count = 0;
-            const int max_checks = 10;
-            bool any_sensor_found = false;
+            const int max_checks = 20; // Increased from 10 to 20 checks
+            int sensors_found = 0;
+            int scan_phase = 0; // To track which phase of scanning we're in
             
-            // Check every second for up to 10 seconds (if no device connects first)
-            while (check_count < max_checks && !any_sensor_found && central_conn == NULL) {
-                // Check if we've found any sensor so far
+            // Continuously check until we've found all sensors or reached max checks
+            while (check_count < max_checks && central_conn == NULL) {
+                // Count how many unique sensors we've received data from
+                sensors_found = 0;
                 for (int i = 0; i < NUM_SENSORS; i++) {
                     if (sensor_trackers[i].data_received) {
-                        any_sensor_found = true;
-                        printk("Found sensor #%d during periodic check\n", i+1);
-                        break;
+                        sensors_found++;
                     }
                 }
                 
-                if (!any_sensor_found) {
+                // Log the discovery progress
+                if (sensors_found > 0) {
+                    printk("Discovered %d/%d sensors so far. Check %d of %d\n", 
+                          sensors_found, NUM_SENSORS, check_count, max_checks);
+                    
+                    // Print which sensors have been found
+                    printk("Sensors found: [");
+                    for (int i = 0; i < NUM_SENSORS; i++) {
+                        if (sensor_trackers[i].data_received) {
+                            printk("%s%d", i > 0 ? ", " : "", i+1);
+                        }
+                    }
+                    printk("]\n");
+                    
+                    // If we've found all sensors, we can exit early
+                    if (sensors_found >= NUM_SENSORS) {
+                        printk("All %d sensors discovered successfully!\n", NUM_SENSORS);
+                        break;
+                    }
+                } else {
                     check_count++;
-                    printk("No sensors found yet, check %d of %d\n", check_count, max_checks);
-                    k_sleep(K_SECONDS(1));
+                    printk("No sensors discovered yet, check %d of %d\n", check_count, max_checks);
                 }
+                
+                // Every 5 checks, stop and restart scanning to improve discovery
+                if (check_count % 5 == 0 && check_count > 0) {
+                    scan_phase++;
+                    printk("Entering scan phase %d - restarting scan to improve discovery\n", scan_phase);
+                    
+                    // Stop scanning
+                    bt_le_scan_stop();
+                    
+                    // Wait a moment before starting again
+                    k_sleep(K_MSEC(100));
+                    
+                    // Start scanning again
+                    int err = bt_le_scan_start(&scan_param, device_found);
+                    if (err) {
+                        printk("Failed to restart scanning during check phase (err %d)\n", err);
+                    }
+                }
+                
+                // Wait between checks
+                k_sleep(K_MSEC(500));
             }
             
             // Wait for connection or timeout
@@ -1170,70 +1398,88 @@ int main(void)
         err = bt_le_per_adv_set_info_transfer(pawr_adv, central_conn, 0);
         if (err) {
             printk("Failed to send PAST (err %d)\n", err);
-        }
-        else // PAST sent successfully
-        {
-            printk("PAST sent\n");
             
-            discover_params.uuid = &pawr_char_uuid.uuid;
-            discover_params.func = discover_func;
-            discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-            discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-            discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-            err = bt_gatt_discover(central_conn, &discover_params);
+            // If PAST fails, disconnect and try again later
+            bt_conn_disconnect(central_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            // Wait for disconnection to complete
+            k_sem_take(&sem_disconnected, K_SECONDS(5));
+            continue;
+        }
+        
+        printk("PAST sent successfully\n");
+        
+        // Add a small delay after PAST before proceeding
+        k_sleep(K_MSEC(50)); // Reduced from 100ms
+        
+        discover_params.uuid = &pawr_char_uuid.uuid;
+        discover_params.func = discover_func;
+        discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+        discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+        discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+        
+        err = bt_gatt_discover(central_conn, &discover_params);
+        if (err) {
+            printk("Discovery failed (err %d)\n", err);
+        }
+        else // Discovery started successfully
+        {
+            printk("Discovery started\n");
+
+            err = k_sem_take(&sem_discovered, K_SECONDS(5));
             if (err) {
-                printk("Discovery failed (err %d)\n", err);
+                printk("Timed out during GATT discovery\n");
             }
-            else // Discovery started successfully
+            else // Discovery completed successfully
             {
-                printk("Discovery started\n");
-
-                err = k_sem_take(&sem_discovered, K_SECONDS(10));
-                if (err) {
-                    printk("Timed out during GATT discovery\n");
+                if (currently_connected_device_id == 0xFF) {
+                    printk("No device ID found\n");
                 }
-                else // Discovery completed successfully
+                else // Device ID found
                 {
-                    if (currently_connected_device_id == 0xFF) {
-                        printk("No device ID found\n");
-                    }
-                    else // Device ID found
-                    {
-                        printk("Device ID: %d --> PAST sent for subevent %d and response slot %d\n",
-                                currently_connected_device_id,
-                                sync_config.subevent,
-                                sync_config.response_slot);
+                    printk("Device ID: %d --> PAST sent for subevent %d and response slot %d\n",
+                            currently_connected_device_id,
+                            sync_config.subevent,
+                            sync_config.response_slot);
 
-                        // Give the device time to process the PAST and sync before writing the PAwR config
-                        k_msleep(2*per_adv_params.interval_min);        
+                    // Give the device time to process the PAST and sync before writing the PAwR config
+                    k_msleep(2*per_adv_params.interval_min);        
 
-                        // Assign the subevent and response slot to the sync_config
-                        // [Note: each node will be assigned a subevent based on their device ID. Response slot will be 0 for all nodes]
+                    // Assign the subevent and response slot to the sync_config
+                    // [Note: each node will be assigned a subevent based on their device ID. Response slot will be 0 for all nodes]
+                    sync_config.subevent = currently_connected_device_id-1;
+                    sync_config.response_slot = 0;
+
+                    // Make sure device ID is in valid range (1-5)
+                    if (currently_connected_device_id > 0 && currently_connected_device_id <= NUM_SENSORS) {
                         sync_config.subevent = currently_connected_device_id-1;
-                        sync_config.response_slot = 0;
+                    } else {
+                        // Default to first subevent if ID is invalid
+                        sync_config.subevent = 0;
+                        printk("Warning: Invalid device ID %d, using subevent 0\n", currently_connected_device_id);
+                    }
+                    sync_config.response_slot = 0;
 
-                        write_params.func = write_func;
-                        write_params.handle = pawr_attr_handle;
-                        write_params.offset = 0;
-                        write_params.data = &sync_config;
-                        write_params.length = sizeof(sync_config);
+                    write_params.func = write_func;
+                    write_params.handle = pawr_attr_handle;
+                    write_params.offset = 0;
+                    write_params.data = &sync_config;
+                    write_params.length = sizeof(sync_config);
 
-                        err = bt_gatt_write(central_conn, &write_params);
+                    err = bt_gatt_write(central_conn, &write_params);
+                    if (err) {
+                        printk("Write failed (err %d)\n", err);
+                    }
+                    else // Write started successfully
+                    {
+                        printk("Write started\n");
+
+                        err = k_sem_take(&sem_written, K_SECONDS(3)); // Reduced from 10 seconds
                         if (err) {
-                            printk("Write failed (err %d)\n", err);
+                            printk("Timed out during GATT write\n");
                         }
-                        else // Write started successfully
+                        else // Write completed successfully
                         {
-                            printk("Write started\n");
-
-                            err = k_sem_take(&sem_written, K_SECONDS(10));
-                            if (err) {
-                                printk("Timed out during GATT write\n");
-                            }
-                            else // Write completed successfully
-                            {
-                                printk("PAwR config written to device %d, disconnecting\n", currently_connected_device_id);
-                            }
+                            printk("PAwR config written to device %d, disconnecting\n", currently_connected_device_id);
                         }
                     }
                 }
@@ -1248,7 +1494,7 @@ int main(void)
         }
 
         printk("Disconnected\n");
-            k_sem_take(&sem_disconnected, K_SECONDS(30));
+            k_sem_take(&sem_disconnected, K_SECONDS(5));
         } else {
             // If not in scanning state, we're either sending sleep commands or sleeping
             // Just wait a bit before checking again

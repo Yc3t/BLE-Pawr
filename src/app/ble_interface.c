@@ -3,6 +3,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/byteorder.h>
 #include <dk_buttons_and_leds.h>
 #include <stdbool.h> // Include for bool type
 
@@ -82,7 +83,7 @@ static volatile bool tx_success_signal = false;
 // Flag to indicate if the device is in the sleep period (checked by recv_cb)
 static volatile bool is_sleeping = false;
 // Sleep duration requested by the central
-static volatile uint32_t requested_sleep_duration_s = 10; // Default 10 seconds
+static volatile uint32_t requested_sleep_duration_s = 60; // Default 10 seconds
 
 // Add this to your global variables
 static struct bt_le_ext_adv *adv;
@@ -383,10 +384,50 @@ uint32_t ble_get_sleep_duration(void)
 void ble_enter_sleep_period(uint32_t duration_s)
 {
     printk("Entering sleep period for %d seconds...\n", duration_s);
+    
+    // Turn off LED3 if you're using it to indicate active state
+    dk_set_led_off(DK_LED3);
+    
+    // Set sleep flag
     is_sleeping = true;
+    
+    // Log sleep time for debugging
+    uint32_t sleep_start_time = k_uptime_get_32();
+    
+    // Sleep for the requested duration
     k_sleep(K_SECONDS(duration_s));
+    
+    // Calculate actual sleep time for logging
+    uint32_t actual_sleep_time = (k_uptime_get_32() - sleep_start_time) / 1000;
+    
+    // Clear sleep flag
     is_sleeping = false;
-    printk("... Woke up from sleep period.\n");
+    
+    // Turn on LED3 to indicate active state
+    dk_set_led_on(DK_LED3);
+    
+    printk("... Woke up after sleeping for %u seconds.\n", actual_sleep_time);
+}
+
+// Add this function to synchronize all sensors using this common sleep handler
+void handle_sleep_request(void)
+{
+    if (sleep_requested) {
+        printk("Processing sleep request from collector\n");
+        
+        // Turn on LED4 briefly to indicate sleep command reception
+        dk_set_led_on(DK_LED4);
+        k_sleep(K_MSEC(100));
+        dk_set_led_off(DK_LED4);
+        
+        // Clear the sleep request flag
+        sleep_requested = false;
+        
+        // Enter sleep period with the requested duration
+        ble_enter_sleep_period(requested_sleep_duration_s);
+        
+        printk("Resuming normal operation after sleep\n");
+    }
 }
 
 static struct bt_uuid_128 pawr_svc_uuid =

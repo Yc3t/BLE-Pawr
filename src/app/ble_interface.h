@@ -23,4 +23,7 @@ bool ble_check_and_clear_tx_success_signal(void);
 // Function to enter sleep period
 void ble_enter_sleep_period(uint32_t duration_s);
 
+// Function to handle sleep requests in a synchronized way
+void handle_sleep_request(void);
+
 #endif

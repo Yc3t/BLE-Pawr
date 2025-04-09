@@ -15,12 +15,14 @@
 #include "app/ble_interface.h"
 
 // Define delay for main loop
-#define LOOP_DELAY_MS 1000 // Regular loop delay
-#define POST_TX_SLEEP_S 10 // Sleep duration after tx
+#define LOOP_DELAY_MS 100 // Shorter regular loop delay for more responsive sleep detection
+#define LED_ACTIVE_INDICATOR DK_LED3
 
 // Sensor data - Replace with fixed payload
-// extern sensor_data_t sensor_data;
 uint32_t fixed_payload;
+
+// Add the handle_sleep_request function declaration
+extern void handle_sleep_request(void);
 
 int main(void)
 {
@@ -44,9 +46,11 @@ int main(void)
     
     // Turn off all LEDs initially
     dk_set_leds(0x00);
+    
+    // Turn on LED3 to indicate active (not sleeping) state
+    dk_set_led_on(LED_ACTIVE_INDICATOR);
 
     // Initialize with fixed sensor data - Replace with fixed payload initialization
-    // sensor_capture_data();
     fixed_payload = 0xAABBCC00 | DEVICE_ID; // Example fixed payload
     printk("Fixed payload set to: 0x%08X\n", fixed_payload);
 
@@ -59,6 +63,8 @@ int main(void)
     // Initialize State Machine
     sensor_node_sm_init();
 
+    printk("Starting main loop - waiting for connection and data requests\n");
+
     do {
         // Run the state machine
         if (sensor_node_sm_run())
@@ -68,24 +74,21 @@ int main(void)
             break;
         }
 
-        // Check for sleep requests from central
-        if (ble_check_and_clear_sleep_request()) {
-            // Get the sleep duration requested by the central
-            uint32_t sleep_duration = ble_get_sleep_duration();
+        // Check for sleep requests from central and handle them
+        handle_sleep_request();
+        
+        // Check if data was successfully transmitted
+        if (ble_check_and_clear_tx_success_signal()) {
+            // Indicate success with a brief LED flash
+            dk_set_led_on(DK_LED2);
+            k_sleep(K_MSEC(50));
+            dk_set_led_off(DK_LED2);
             
-            // Enter the sleep period with the requested duration
-            printk("Sleep requested by central for %d seconds\n", sleep_duration);
-            ble_enter_sleep_period(sleep_duration);
-        } 
-        // Check if data was successfully transmitted but no sleep command
-        else if (ble_check_and_clear_tx_success_signal()) {
-            // No need to sleep if not requested by central
-            printk("Data transmitted successfully, no sleep requested\n");
-        } 
-        else {
-            // Normal operation delay
-            k_msleep(LOOP_DELAY_MS);
+            printk("Data transmitted successfully\n");
         }
+        
+        // Short delay for main loop
+        k_msleep(LOOP_DELAY_MS);
 
     } while (true);
 
